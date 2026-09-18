@@ -1,7 +1,7 @@
 # Envoy Gateway on Cilium/OpenStack 클러스터 — 구성 정리
 
 > 환경: CAPI v1.12.3 / CAPO v0.14.1, Kubernetes v1.35.2 (kubeadm), Cilium v1.19.1 (Gateway API 활성화),
-> OpenStack CCM(Octavia)이 LoadBalancer IPAM 전담, 사설 레지스트리 `10.14.22.22/dockerhub-proxy`(Docker Hub 프록시).
+> OpenStack CCM(Octavia)이 LoadBalancer IPAM 전담, 사설 레지스트리 `10.4.22.22/dockerhub-proxy`(Docker Hub 프록시).
 > Envoy Gateway v1.9.1 도입 검토/테스트 과정 정리.
 
 ---
@@ -136,7 +136,7 @@ kubectl get validatingadmissionpolicy safe-upgrades.gateway.networking.k8s.io 2>
 ## 7. EnvoyProxy의 필요성과 YAML 설정 의미
 
 **필요한 이유** (이 환경에서는 사실상 필수):
-1. **이미지 레지스트리 오버라이드** — `10.14.22.22/dockerhub-proxy` 반영은 Gateway API 표준 필드에 없는 개념이라 EnvoyProxy가 유일한 경로.
+1. **이미지 레지스트리 오버라이드** — `10.4.22.22/dockerhub-proxy` 반영은 Gateway API 표준 필드에 없는 개념이라 EnvoyProxy가 유일한 경로.
 2. **Octavia LB annotation** — `Gateway.spec.infrastructure.annotations`가 기본 모드에선 막혀 있어 EnvoyProxy가 유일한 경로 (2, 3번 참고).
 
 **YAML 필드 설명**:
@@ -153,7 +153,7 @@ spec:
     kubernetes:
       envoyDeployment:
         container:
-          image: 10.14.22.22/dockerhub-proxy/envoyproxy/envoy:<tag>
+          image: 10.4.22.22/dockerhub-proxy/envoyproxy/envoy:<tag>
           # 실제 데이터플레인 컨테이너 이미지. 미지정 시 global.imageRegistry가
           # 반영된 차트 기본값이 자동 사용됨.
       envoyService:
@@ -196,7 +196,7 @@ spec:
 ### 사전 확인 완료 사항
 - Gateway API v1.4.1 CRD 이미 설치 + 호환 확인됨 (6번)
 - `CiliumLoadBalancerIPPool` 없음 → 테스트 안전 (4번)
-- 이미지 레지스트리: `10.14.22.22/dockerhub-proxy`
+- 이미지 레지스트리: `10.4.22.22/dockerhub-proxy`
 
 ### 절차
 
@@ -214,7 +214,7 @@ kubectl get crd | grep gateway.envoyproxy.io
 #    crds:
 #      enabled: false
 #    global:
-#      imageRegistry: "10.14.22.22/dockerhub-proxy"
+#      imageRegistry: "10.4.22.22/dockerhub-proxy"
 
 # 4) 로컬 차트로 설치
 helm install eg ./gateway-helm \
@@ -404,6 +404,8 @@ kubectl get svc -n gw-ns-test -o jsonpath='{.items[0].metadata.annotations}'
 ---
 
 ## 13. Merged Gateways
+
+![Merged Gateways 개념 - mergeGateways false vs true 비교](./images/merged-gateways.svg)
 
 - `EnvoyProxy.spec.mergeGateways: true`로 활성화.
 - 같은 GatewayClass 아래 있는 **여러 Gateway의 리스너를 하나의 공유 Envoy fleet(Deployment+Service)으로 합쳐서** 처리하는 기능. 기본은 Gateway 1개 = 전용 fleet 1개.
