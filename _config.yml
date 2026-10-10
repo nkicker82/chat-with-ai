@@ -2,30 +2,60 @@ title: chat with ai
 url: "https://nkicker82.github.io"
 baseurl: "/chat-with-ai"
 
+# 테마를 고정하려면 뒤에 @태그 를 붙입니다 (예: just-the-docs/just-the-docs@vX.Y.Z)
 remote_theme: just-the-docs/just-the-docs
 
 plugins:
   - jekyll-remote-theme
-  - jekyll-include-cache           # Just the Docs 의존성
-  - jekyll-optional-front-matter
-  - jekyll-relative-links
-  - jekyll-titles-from-headings
-
-optional_front_matter:
-  remove_originals: true
+  - jekyll-include-cache        # Just the Docs 의존성
+  - jekyll-relative-links       # [링크](other.md) → other.html 자동 변환
+  - jekyll-titles-from-headings # title 이 없으면 첫 번째 # 제목 사용
 
 relative_links:
   enabled: true
-  collections: false
+  collections: true             # 컬렉션 문서 안의 .md 링크도 변환
+
+# 검색창, 제목 앵커
+search_enabled: true
+heading_anchors: true
+
+# ─────────────────────────────────────────────
+# 컬렉션 = 폴더 하나가 사이드바의 접이식 섹션 하나
+# 폴더를 추가하려면 아래 3곳에 같은 이름을 추가합니다.
+#   1) collections            (Jekyll이 폴더를 문서로 인식)
+#   2) just_the_docs.collections  (사이드바 섹션 이름과 접기 설정)
+#   3) defaults               (해당 폴더 문서에 레이아웃 적용)
+# 그리고 저장소 루트에 _<이름>/ 폴더를 만듭니다. (예: _claude/)
+# ─────────────────────────────────────────────
+collections:
+  claude:
+    permalink: "/:collection/:path/"
+    output: true
+  envoy-gateway:
+    permalink: "/:collection/:path/"
+    output: true
+
+just_the_docs:
+  collections:
+    claude:
+      name: Claude
+      nav_fold: true
+    envoy-gateway:
+      name: Envoy Gateway
+      nav_fold: true
 
 defaults:
   - scope:
       path: ""
-      type: pages
+      type: claude
+    values:
+      layout: default
+  - scope:
+      path: ""
+      type: envoy-gateway
     values:
       layout: default
 
-# 사이트에 올리고 싶지 않은 파일
 exclude:
   - Gemfile
   - Gemfile.lock
