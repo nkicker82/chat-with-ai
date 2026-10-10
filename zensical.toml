@@ -1,0 +1,9 @@
+[project]
+site_name = "chat with ai"
+site_url = "https://nkicker82.github.io/chat-with-ai/"
+site_description = "Claude 채팅에서 정리한 내용을 markdown으로 모아 두는 문서 사이트"
+docs_dir = "docs"
+site_dir = "site"
+
+[project.theme]
+language = "ko"
