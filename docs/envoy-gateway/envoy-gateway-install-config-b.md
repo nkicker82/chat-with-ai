@@ -11,7 +11,7 @@
 - [1. 설치 환경](#1-설치-환경)
 - [2. 작업 개요](#2-작업-개요)
 - [3. 작업 상세](#3-작업-상세)
-  - [Step 0. 차트 준비와 values 작성](#step-0-차트-준비와-values-작성)
+  - [Step 0. 차트 받기와 values 작성](#step-0-차트-받기와-values-작성)
   - [Step 1. 사전 점검](#step-1-사전-점검)
   - [Step 2. 기존 리소스 백업](#step-2-기존-리소스-백업)
   - [Step 3. Gateway API CRD dry-run](#step-3-gateway-api-crd-dry-run)
@@ -49,7 +49,7 @@
 
 | 구성 요소 | 버전 | 비고 |
 |---|---|---|
-| Envoy Gateway 차트 | `gateway-helm` **1.9.2** | `gateway-helm-1_9_2.tgz` |
+| Envoy Gateway 차트 | `gateway-helm` **v1.9.2** | `oci://docker.io/envoyproxy/gateway-helm`에서 `helm pull` |
 | EG 컨트롤러 이미지 | `envoyproxy/gateway:v1.9.2` | |
 | Ratelimit 이미지 | `envoyproxy/ratelimit:0482748e` | 1.9.2 차트 기본 태그 |
 | Envoy 프록시 이미지 | `envoyproxy/envoy:distroless-v1.39.3` | 차트 기본값(v1.39.1) 대신 보안 패치 버전. [1-5](#1-5-envoy-프록시-이미지-버전) 참고 |
@@ -119,7 +119,7 @@
 
 | Step | 작업 | 대상 | 되돌리기 |
 |---|---|---|---|
-| 0 | 차트 풀기, `eg-values.yaml` 작성, 렌더링 확인 | 작업 PC | 해당 없음 |
+| 0 | `helm pull`로 차트 받기, 차트 풀기, `eg-values.yaml` 작성, 렌더링 확인 | 작업 PC | 해당 없음 |
 | 1 | 사전 점검 (CRD 상태, 이전 설치 흔적, LB-IPAM, route 값) | 클러스터 (조회) | 해당 없음 |
 | 2 | Gateway API 리소스 백업 | 클러스터 (조회) | 해당 없음 |
 | 3 | Gateway API CRD v1.6.1 server dry-run | 클러스터 (dry-run) | 해당 없음 |
@@ -133,7 +133,7 @@
 
 ```mermaid
 flowchart LR
-  S0[0. 차트/values 준비] --> S1[1. 사전 점검] --> S2[2. 백업] --> S3[3. CRD dry-run]
+  S0[0. 차트 pull/values 준비] --> S1[1. 사전 점검] --> S2[2. 백업] --> S3[3. CRD dry-run]
   S3 --> S4[4. Gateway API CRD v1.6.1 exp]
   S4 --> S5[5. safe-upgrades VAP]
   S5 --> S6{6. Cilium operator<br/>재시작 정상?}
@@ -147,15 +147,50 @@ flowchart LR
 
 ## 3. 작업 상세
 
-### Step 0. 차트 준비와 values 작성
+### Step 0. 차트 받기와 values 작성
 
-#### 0-1. 차트 풀기
+#### 0-1. 차트 받기 (`helm pull`)
+
+EG 차트는 Docker Hub의 OCI 레지스트리로 배포됩니다. 버전은 `v` 접두사를 붙여 지정합니다.
 
 ```bash
-tar -xzf gateway-helm-1_9_2.tgz
+EG_VERSION=v1.9.2
+mkdir -p eg-${EG_VERSION} && cd eg-${EG_VERSION}
+
+# Docker Hub에서 직접 받는 경우
+helm pull oci://docker.io/envoyproxy/gateway-helm --version ${EG_VERSION}
+
+ls -l gateway-helm-*.tgz        # gateway-helm-v1.9.2.tgz
+```
+
+작업 PC가 Docker Hub에 직접 나갈 수 없으면 사설 레지스트리의 Docker Hub 프록시를 경유합니다. 프록시가 OCI Helm 차트까지 캐시하는지는 환경마다 다르므로 먼저 `helm show chart`로 확인합니다.
+
+```bash
+REG=10.4.22.22/dockerhub-proxy
+
+# 레지스트리 로그인이 필요하면 사용자가 미리 직접 실행해 둡니다 (자격 증명은 문서나 스크립트에 적지 않음)
+#   helm registry login 10.4.22.22
+
+helm show chart oci://${REG}/envoyproxy/gateway-helm --version ${EG_VERSION}
+helm pull oci://${REG}/envoyproxy/gateway-helm --version ${EG_VERSION}
+# HTTP 레지스트리면 --plain-http, 사설 CA면 --ca-file <CA 파일> 추가
+```
+
+받은 차트의 버전을 확인합니다. `version`과 `appVersion`이 모두 `v1.9.2`여야 합니다.
+
+```bash
+helm show chart gateway-helm-${EG_VERSION}.tgz | grep -E '^(name|version|appVersion):'
+```
+
+#### 0-2. 차트 풀기
+
+```bash
+tar -xzf gateway-helm-${EG_VERSION}.tgz
 CHART=./gateway-helm
 CRD_DIR=$CHART/charts/crds/crds
 ```
+
+이후 단계의 명령은 모두 이 디렉터리(`eg-v1.9.2/`)에서 실행한다고 가정합니다.
 
 1.9.2 차트에서 사용할 경로는 다음과 같습니다.
 
@@ -165,7 +200,7 @@ CRD_DIR=$CHART/charts/crds/crds
 | `charts/crds/crds/generated/*.yaml` | EG CRD 8개 (envoyproxies는 1.2–1.4MB → server-side apply 필수) |
 | `charts/crds/templates/gatewayapi-safe-upgrade-policy.yaml` | safe-upgrades ValidatingAdmissionPolicy(VAP)와 바인딩 |
 
-#### 0-2. `eg-values.yaml`
+#### 0-3. `eg-values.yaml`
 
 ```yaml
 # eg-values.yaml (gateway-helm 1.9.2 차트 기준 검증)
@@ -188,7 +223,7 @@ podDisruptionBudget:
   minAvailable: 1
 ```
 
-#### 0-3. 렌더링 확인
+#### 0-4. 렌더링 확인
 
 차트에 values 스키마가 없어서 잘못된 키는 에러 없이 무시됩니다. 설치 전에 렌더링 결과로 반드시 확인합니다.
 
@@ -492,4 +527,4 @@ helm upgrade cilium cilium/cilium --version <대상버전> -n kube-system -f cil
 | `crds.gatewayAPI.safeUpgradePolicy.enabled=false` | VAP만 끔 (`crds.enabled=true`일 때만 의미) |
 | CRD 제외 없이 기존 CRD 위에 install | 없는 CRD만 생성하고 기존 CRD는 갱신 안 함 → v1.4.1과 v1.6.1 혼재 + VAP 생성 |
 | `global.imageRegistry`와 전체 경로 image를 함께 사용 | 첫 경로 구간이 치환되어 `.../dockerhub-proxy/dockerhub-proxy/...`로 깨짐 |
-| `global.images.envoyProxy.image` 미지정 | 렌더링 결과에 envoyProxy 블록이 생성되지 않음 → Step 0-3에서 이미지 3종이 모두 나오는지 확인 |
+| `global.images.envoyProxy.image` 미지정 | 렌더링 결과에 envoyProxy 블록이 생성되지 않음 → Step 0-4에서 이미지 3종이 모두 나오는지 확인 |
