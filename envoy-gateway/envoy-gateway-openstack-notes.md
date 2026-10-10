@@ -1,8 +1,3 @@
----
-title: Envoy Gateway with OpenStack CCM
-nav_order: 2
----
-
 # Envoy Gateway on Cilium/OpenStack 클러스터 — 구성 정리
 
 > 환경: CAPI v1.12.3 / CAPO v0.14.1, Kubernetes v1.35.2 (kubeadm), Cilium v1.19.1 (Gateway API 활성화),
