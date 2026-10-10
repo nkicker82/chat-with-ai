@@ -27,6 +27,5 @@ defaults:
 
 # 사이트에 올리고 싶지 않은 파일
 exclude:
-  - README.md
   - Gemfile
   - Gemfile.lock
