@@ -11,40 +11,30 @@ Claude 채팅에서 정리한 내용을 markdown으로 모아 두는 문서 사�
 
 ## 문서 목록
 
-{% for c in site.collections %}
-{% unless c.label == "posts" %}
-{% assign section = site.just_the_docs.collections[c.label].name | default: c.label %}
-{% assign docs = c.docs | where_exp: "d", "d.nav_exclude != true" | sort: "title" %}
+{% assign groups = site.html_pages | where_exp: "p", "p.dir != '/'" | group_by: "dir" | sort: "name" %}
+{% for g in groups %}
 
-### {{ section }}
+### {{ g.name | remove_first: "/" | remove_last: "/" }}
 
-{% for d in docs %}
-- [{{ d.title }}]({{ d.url | relative_url }})
+{% assign items = g.items | where_exp: "p", "p.nav_exclude != true" | sort: "title" %}
+{% for p in items %}
+- [{{ p.title | default: p.name }}]({{ p.url | relative_url }})
 {% endfor %}
 
-{% endunless %}
 {% endfor %}
 
 ## 문서 추가 방법
 
-1. 저장소 루트에 `_<컬렉션 이름>/` 폴더를 만들고 markdown 파일을 넣습니다. 폴더 이름 앞의 `_`가 필요합니다.
-2. 파일 맨 위에 front matter를 적습니다.
+1. 최상위 폴더(`claude/`, `envoy-gateway/` 등) 아래에 markdown 파일을 넣습니다. 하위 폴더도 됩니다.
+2. 파일 맨 위에 `# 제목`을 적습니다. 이 제목이 사이드바와 목록에 보이는 문서 이름이 됩니다.
 3. `main` 브랜치에 push 하고, Actions 탭에서 `pages build and deployment`가 성공하면 1~2분 뒤 반영됩니다.
 
-```markdown
----
-title: 문서 제목
----
+front matter는 필요 없습니다. 순서를 직접 정하고 싶은 문서에만 맨 위에 `nav_order: 숫자`를 넣은 front matter를 추가하면 됩니다.
 
-# 본문 시작
-```
+### 새 최상위 폴더 추가
 
-사이드바 순서는 기본적으로 제목순이고, 직접 정하려면 front matter에 `nav_order: 숫자`를 추가합니다.
+`_config.yml`의 `defaults`에 같은 이름의 폴더 항목을 하나 추가합니다.
 
-### 새 컬렉션(폴더) 추가
+### 주의
 
-`_config.yml`의 `collections`, `just_the_docs.collections`, `defaults` 세 곳에 같은 이름을 추가해야 합니다.
-
-### 코드 블록 주의
-
-코드 안에 Liquid 문법(중괄호 두 개, 또는 중괄호와 퍼센트 기호로 시작하는 구문)이 들어 있으면 Jekyll이 코드 블록 안에서도 해석해서 빌드가 실패할 수 있습니다. 이런 내용은 `raw`와 `endraw` 태그로 감싸 주세요.
+front matter를 직접 넣은 문서에 Liquid 문법(중괄호 두 개, 또는 중괄호와 퍼센트 기호로 시작하는 구문)이 들어 있으면 코드 블록 안에서도 해석되어 빌드가 실패할 수 있습니다. 이런 내용은 `raw`와 `endraw` 태그로 감싸 주세요.
