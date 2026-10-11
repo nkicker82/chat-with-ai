@@ -2,17 +2,11 @@
 
 > EG 1.9.2 + Gateway API CRD v1.6.1 experimental(차트 번들) + Cilium 1.19.1 유지
 
-이 문서는 Cilium Gateway 가 이미 동작 중인 CAPI/CAPO 기반 Kubernetes 클러스터에 
-Envoy Gateway(EG)를 함께 설치하는 절차를 설명합니다.
+이 문서는 Cilium Gateway 가 이미 동작 중인 CAPI/CAPO 기반 Kubernetes 클러스터에 Envoy Gateway(EG)를 함께 설치하는 절차를 설명합니다.
 
-설치되어 있는 cilium Gateway 1.19.1 버전에 호환되는 Gateway API CRD 버전은 v1.4.1 이지만,
-CRD 버전을 유지했을 때 호환되는 EG 버전은 1.7.X 이고 이 버전은 이미 EOL 상태(2026년 10월 기준).
-Cilium은 CNI, kube-proxy replacement, Gateway API 기능을 수행하고 있어서 업그레이드시 추가 고려 부분이 많다고 판단.
-Gateway API CRD v1.6.1 experimental 이 EG 최신 버전인 1.9.2 의 호환 버전이고, cilium v1.19.1 이 요구하는 Gateway API 의 apiVersion 과 동일.
+설치되어 있는 cilium Gateway 1.19.1 버전에 호환되는 Gateway API CRD 버전은 v1.4.1 이지만, CRD 버전을 유지했을 때 호환되는 EG 버전은 1.7.X 이고 이 버전은 이미 EOL 상태(2026년 10월 기준). Cilium은 CNI, kube-proxy replacement, Gateway API 기능을 수행하고 있어서 업그레이드시 추가 고려 부분이 많다고 판단. Gateway API CRD v1.6.1 experimental 이 EG 최신 버전인 1.9.2 의 호환 버전이고, cilium v1.19.1 이 요구하는 Gateway API 의 apiVersion 과 동일.
 
-결론적으로,
-Cilium은 유지, Gateway API CRD v1.6.1 experimental 로 업데이트하는 **브리지 구성**.
-차후 Cilium만 1.20 으로 올리면 Gateway API CRD v1.6.1 과의 호환성도 충족 가능함.
+결론적으로, Cilium은 유지, Gateway API CRD v1.6.1 experimental 로 업데이트하는 브리지 구성. 차후 Cilium만 1.20 으로 올리면 Gateway API CRD v1.6.1 과의 호환성도 충족 가능함.
 
 ---
 
@@ -142,13 +136,35 @@ Cilium은 유지, Gateway API CRD v1.6.1 experimental 로 업데이트하는 **�
 | 10 | 설치 후 검증 (테스트 Gateway, Service annotation, 프록시 이미지) | 클러스터 | — |
 
 ```mermaid
-flowchart LR
-  S0[0. 차트 pull/values 준비] --> S1[1. 사전 점검] --> S2[2. 백업] --> S3[3. CRD dry-run]
-  S3 --> S4[4. Gateway API CRD v1.6.1 exp]
-  S4 --> S5[5. safe-upgrades VAP]
-  S5 --> S6{6. Cilium operator<br/>재시작 정상?}
-  S6 -- 예 --> S7[7. EG CRD] --> S8[8. EG helm install] --> S9[9. EnvoyProxy/GatewayClass] --> S10[10. 검증]
-  S6 -- 아니오 --> X[중단 후 원인 분석]
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#ffffff', 'primaryTextColor': '#1b1b1b', 'primaryBorderColor': '#2e7d32', 'lineColor': '#455a64', 'edgeLabelBackground': '#ffffff', 'clusterBkg': '#e8f5e9', 'clusterBorder': '#66bb6a', 'titleColor': '#1b5e20'}}}%%
+flowchart TB
+  subgraph R1["① 준비 · 점검"]
+    direction LR
+    S0["0. 차트 pull<br/>values 준비"] --> S1["1. 사전 점검"] --> S2["2. 백업"] --> S3["3. CRD dry-run"]
+  end
+
+  subgraph R2["② Gateway API CRD 변경 (되돌릴 수 없음)"]
+    direction LR
+    S4["4. Gateway API CRD<br/>v1.6.1 exp 적용"] --> S5["5. safe-upgrades<br/>VAP 적용"] --> S6{"6. Cilium operator<br/>재시작 정상?"}
+    S6 -- 아니오 --> X["중단 후<br/>원인 분석"]
+  end
+
+  subgraph R3["③ Envoy Gateway 설치"]
+    direction LR
+    S7["7. EG CRD 적용"] --> S8["8. EG helm install"] --> S9["9. EnvoyProxy<br/>GatewayClass 적용"] --> S10["10. 설치 후 검증"]
+  end
+
+  R1 --> R2
+  R2 -- "6번 정상" --> R3
+
+  classDef default fill:#ffffff,stroke:#2e7d32,color:#1b1b1b;
+  classDef stop fill:#ffffff,stroke:#d33,stroke-width:2px,color:#1b1b1b;
+  class X stop
+  linkStyle default stroke:#455a64,stroke-width:1.5px;
+
+  style R1 fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+  style R2 fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
+  style R3 fill:#e8f5e9,stroke:#66bb6a,color:#1b5e20
 ```
 
 **핵심 원칙:** CRD는 tgz에서 꺼내 `kubectl apply --server-side`로 직접 관리하고, Helm 차트로는 **컨트롤러만** 설치합니다.
