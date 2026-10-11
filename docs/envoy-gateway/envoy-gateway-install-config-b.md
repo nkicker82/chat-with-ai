@@ -2,7 +2,17 @@
 
 > EG 1.9.2 + Gateway API CRD v1.6.1 experimental(차트 번들) + Cilium 1.19.1 유지
 
-이 문서는 Cilium Gateway가 이미 동작 중인 CAPI/CAPO 기반 Kubernetes 클러스터에 Envoy Gateway(EG)를 함께 설치하는 절차입니다. Cilium은 그대로 두고 Gateway API CRD만 v1.6.1 experimental로 올리는 **브리지 구성**이며, 이후 Cilium만 1.20으로 올리면 전부 지원 범위인 구성 C가 됩니다.
+이 문서는 Cilium Gateway 가 이미 동작 중인 CAPI/CAPO 기반 Kubernetes 클러스터에 
+Envoy Gateway(EG)를 함께 설치하는 절차를 설명합니다.
+
+설치되어 있는 cilium Gateway 1.19.1 버전에 호환되는 Gateway API CRD 버전은 v1.4.1 이지만,
+CRD 버전을 유지했을 때 호환되는 EG 버전은 1.7.X 이고 이 버전은 이미 EOL 상태(2026년 10월 기준).
+Cilium은 CNI, kube-proxy replacement, Gateway API 기능을 수행하고 있어서 업그레이드시 추가 고려 부분이 많다고 판단.
+Gateway API CRD v1.6.1 experimental 이 EG 최신 버전인 1.9.2 의 호환 버전이고, cilium v1.19.1 이 요구하는 Gateway API 의 apiVersion 과 동일.
+
+결론적으로,
+Cilium은 유지, Gateway API CRD v1.6.1 experimental 로 업데이트하는 **브리지 구성**.
+차후 Cilium만 1.20 으로 올리면 Gateway API CRD v1.6.1 과의 호환성도 충족 가능함.
 
 ---
 
