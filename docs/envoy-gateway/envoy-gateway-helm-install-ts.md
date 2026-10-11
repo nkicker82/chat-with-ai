@@ -1,26 +1,27 @@
-# Envoy Gateway v1.9.2 Helm 설치 및 트러블슈팅 가이드
+# Envoy Gateway v1.9.2 — gateway-helm 번들 CRD 기반 설치 및 트러블슈팅 가이드
 
-> **요약** — Cilium Gateway API가 이미 켜진 클러스터에서는 **Gateway API CRD를 Helm 릴리스와 분리**해 먼저 올리고(`gateway-crds-helm` → `kubectl apply --server-side`), 그 다음 `gateway-helm`을 `crds.enabled=false`로 설치한다.
-> `gateway-helm`의 번들 CRD(`crds/` 디렉터리)는 **이미 CRD가 있으면 조용히 건너뛰기** 때문에, 기존 v1.4.1 CRD 위에 그대로 `helm install` 하면 EG 1.9.2 컨트롤러가 기동에 실패하거나 일부 Route가 무시된다.
-> Cilium 1.19.1을 유지하므로, CRD를 v1.6.1 experimental로 올리기 전 **TLSRoute 서빙 버전 Go/No-Go 점검**이 필수다.
+> **요약** — CRD는 `gateway-helm` 차트에 포함된 번들(`charts/crds/crds/`)만 사용한다. 다만 Helm은 `crds/`의 CRD를 **없을 때만 생성**하므로, Gateway API CRD가 이미 있는 클러스터(Cilium Gateway 사용 중)에서는 **같은 차트의 CRD 파일을 `kubectl apply --server-side`로 먼저 적용**한 뒤 `helm install`을 실행한다.
+> 순서가 바뀌면 Helm이 기존 CRD 6종을 v1.4.1 standard로 남긴 채 safe-upgrades VAP를 만들고, 이후 VAP가 experimental 전환을 거부해 **CRD를 올릴 수 없는 상태**에 빠진다.
+> 첨부 차트(1.9.2) 분석 결과 TLSRoute CRD는 `v1alpha2`를 계속 서빙하므로, Cilium 1.19.1 유지 조건의 1차 게이트는 **Go**다 (실클러스터 검증은 Phase 5).
 
 ---
 
 ## 목차
 
 1. [대상 환경](#1-대상-환경)
-2. [설치 전 반드시 알아야 할 핵심 5가지](#2-설치-전-반드시-알아야-할-핵심-5가지)
+2. [차트 분석으로 확인된 핵심 사항](#2-차트-분석으로-확인된-핵심-사항)
 3. [차트 구조와 설치 흐름](#3-차트-구조와-설치-흐름)
-4. [Phase 0 — 사전 점검](#4-phase-0--사전-점검)
-5. [Phase 1 — 차트 확보 및 번들 확인](#5-phase-1--차트-확보-및-번들-확인)
-6. [Phase 2 — CRD 적용 (Helm 외부)](#6-phase-2--crd-적용-helm-외부)
-7. [Phase 3 — gateway-helm 설치](#7-phase-3--gateway-helm-설치)
-8. [Phase 4 — 설치 검증 (스모크 테스트)](#8-phase-4--설치-검증-스모크-테스트)
-9. [Phase 5 — Cilium 공존 검증](#9-phase-5--cilium-공존-검증)
-10. [트러블슈팅](#10-트러블슈팅)
-11. [진단 정보 수집 스크립트](#11-진단-정보-수집-스크립트)
-12. [롤백 / 제거](#12-롤백--제거)
-13. [참고 자료](#13-참고-자료)
+4. [gateway-helm 설치 시 내부 동작](#4-gateway-helm-설치-시-내부-동작)
+5. [Phase 0 — 사전 점검](#5-phase-0--사전-점검)
+6. [Phase 1 — 차트 확보 및 번들 비교](#6-phase-1--차트-확보-및-번들-비교)
+7. [Phase 2 — 번들 CRD 선적용](#7-phase-2--번들-crd-선적용)
+8. [Phase 3 — helm install](#8-phase-3--helm-install)
+9. [Phase 4 — 스모크 테스트](#9-phase-4--스모크-테스트)
+10. [Phase 5 — Cilium 공존 검증](#10-phase-5--cilium-공존-검증)
+11. [트러블슈팅](#11-트러블슈팅)
+12. [진단 정보 수집 스크립트](#12-진단-정보-수집-스크립트)
+13. [업그레이드 / 롤백 / 제거](#13-업그레이드--롤백--제거)
+14. [참고 자료](#14-참고-자료)
 
 ---
 
@@ -28,273 +29,402 @@
 
 | 구성요소 | 버전 / 값 | 비고 |
 |---|---|---|
-| Envoy Gateway | **v1.9.2** | 차트: `oci://docker.io/envoyproxy/gateway-helm` |
-| Gateway API CRD | **v1.6.1, experimental** | EG 1.9.2 차트 번들과 동일 번들 |
+| Envoy Gateway | **v1.9.2** | 차트 `gateway-helm` (Chart.yaml `version: 1.9.2`, `appVersion: v1.9.2`) |
+| Gateway API CRD | **v1.6.1, experimental** | `gateway-helm/charts/crds/crds/gatewayapi-crds.yaml` |
+| EG CRD | 8종 (`gateway.envoyproxy.io`) | `gateway-helm/charts/crds/crds/generated/` |
 | Cilium | **1.19.1 (유지)** | CNI + KPR + Gateway API 활성 |
-| Kubernetes | v1.34.x ~ v1.35.x | CAPI/CAPO, OCCM + Octavia(amphora) |
+| Kubernetes | v1.34.x ~ v1.35.x | VAP `admissionregistration.k8s.io/v1` 사용 → 1.30 이상 필요 |
 | 기존 Gateway API CRD | v1.4.1 standard (예: k8s-test) | Cilium Gateway가 사용 중 |
-| GatewayClass controllerName | EG: `gateway.envoyproxy.io/gatewayclass-controller`<br>Cilium: `io.cilium/gateway-controller` | 서로 다른 값으로 공존 |
+| GatewayClass controllerName | EG `gateway.envoyproxy.io/gatewayclass-controller` / Cilium `io.cilium/gateway-controller` | 서로 다른 값으로 공존 |
 
-공통 변수 (이후 모든 명령에서 사용):
+공통 변수:
 
 ```bash
 export EG_VERSION=v1.9.2
 export EG_NS=envoy-gateway-system
-export EG_RELEASE=eg
+export EG_RELEASE=eg                       # fullname → "eg-gateway-helm"
 export WORKDIR=~/eg-install/${EG_VERSION}
 export REGISTRY=harbor.lab.example/dockerhub-proxy   # 예시값. 실제 레지스트리 프록시 경로로 교체
-mkdir -p ${WORKDIR}/rendered ${WORKDIR}/backup
+mkdir -p ${WORKDIR}/{rendered,backup,logs}
 ```
 
 > 레지스트리·클러스터 인증은 작업자가 로컬에서 미리 완료해 두고(`helm registry login`, kubeconfig), 이 문서의 명령은 그 결과만 사용한다.
 
 ---
 
-## 2. 설치 전 반드시 알아야 할 핵심 5가지
+## 2. 차트 분석으로 확인된 핵심 사항
 
-1. **Helm `crds/` 디렉터리는 "없을 때만 생성"**
-   - 이미 존재하는 CRD는 건너뜀(`--debug` 시 `CRD ... is already present. Skipping.` 로그)
-   - `helm upgrade`로 갱신되지 않고, `helm uninstall`로 삭제되지도 않음
-   - → 기존 v1.4.1 CRD가 있는 클러스터에서 기본값(`crds.enabled=true`)으로 설치하면 CRD가 v1.4.1로 남음
-2. **EG 1.9는 Gateway API v1.6 CRD가 선행 조건**
-   - TCPRoute/UDPRoute를 `gateway.networking.k8s.io/v1`으로 reconcile
-   - v1.6 CRD 없이 EG를 올리면 TCP/UDP Route가 **에러 없이 무시**됨
-3. **safe-upgrades ValidatingAdmissionPolicy(VAP)** (Gateway API v1.5+)
-   - standard CRD 위에 experimental CRD 설치 금지, 구버전 CRD 설치 금지
-   - EG 1.9 차트는 이 VAP를 `crds.enabled=true`일 때 템플릿으로 렌더링 (`--skip-crds`로는 안 꺼짐)
-   - → **standard → experimental 전환은 VAP가 없는 상태에서만 가능.** 현 환경(v1.4.1, VAP 없음)에서 CRD를 먼저 올려야 하는 이유
-4. **대형 CRD는 반드시 server-side apply**
-   - experimental CRD는 client-side apply 시 `last-applied-configuration` 어노테이션 크기 제한(262,144 bytes) 초과
-   - CRD를 Helm 템플릿으로 릴리스에 넣으면 릴리스 Secret 1 MiB 제한에 걸릴 수 있음 → `helm template | kubectl apply --server-side`
-5. **Cilium 1.19.1 호환성은 "TLSRoute 서빙 버전"이 관건**
-   - Cilium 1.19는 Gateway API v1.4 기준(v1.4.1 CRD 문서화, 컨포먼스 v1.4.0)
-   - Gateway API v1.5 릴리스 노트는 TLSRoute v1alpha2를 v1.6에서 experimental 채널에서도 제거한다고 예고했으나, v1.6 릴리스 노트에는 명시가 없음 → **렌더링 결과로 직접 확인**
-   - v1.5.1 CRD 환경에서 Cilium 1.19.x operator가 실패한 사례 보고 있음 (참고 자료 참조)
+`gateway-helm` 1.9.2 tgz를 풀어 템플릿과 CRD 파일을 직접 확인한 결과다.
+
+1. **CRD 21종이 서브차트 `crds`의 `crds/` 디렉터리에 있음**
+   - Gateway API 13종(v1.6.1 experimental) + EG 8종
+   - 서브차트 포함 여부는 `crds.enabled`(기본 `true`) 하나로 결정
+   - `crds/`는 템플릿이 아니라 Helm의 CRD 전용 경로 → **없을 때만 생성, upgrade·uninstall 시 손대지 않음**
+2. **safe-upgrades VAP는 서브차트의 일반 템플릿**
+   - `lookup`으로 기존 VAP를 조회해 **없거나 같은 릴리스 소유일 때만 렌더링** → 다른 주체가 만든 VAP가 있으면 조용히 건너뜀 (ownership 오류 없음)
+   - 규칙 1: standard CRD 위에 experimental CRD **UPDATE 거부**
+   - 규칙 2: `bundle-version`이 v1.5 미만인 CRD **CREATE/UPDATE 거부**
+   - `--skip-crds`로는 꺼지지 않음. 끄려면 `crds.gatewayAPI.safeUpgradePolicy.enabled=false` 또는 `crds.enabled=false`
+3. **TLSRoute 서빙 버전 (Cilium 1.19.1 게이트)**
+   - 번들 TLSRoute: `v1`(storage), `v1alpha2`(served, deprecated), `v1alpha3`(served, deprecated)
+   - TCPRoute/UDPRoute도 `v1alpha2` 계속 서빙 → Cilium 1.19의 v1alpha2 watch 대상이 유지됨
+4. **certgen과 topology injector webhook은 Helm hook**
+   - `pre-install, pre-upgrade` 훅이며 **릴리스 리소스로 추적되지 않음** → `helm uninstall` 후에도 남음
+   - webhook `failurePolicy: Ignore` → webhook 장애가 Pod 생성을 막지는 않음
+5. **이미지 레지스트리 오버라이드의 함정**
+   - `global.imageRegistry`는 envoy-gateway·ratelimit 이미지에는 적용되지만, **데이터플레인 Envoy 이미지는 `global.images.envoyProxy.image`가 비어 있으면 적용되지 않음** (컨트롤러 내장 기본값 `docker.io/...` 사용)
+   - ratelimit 기본 이미지는 `docker.io/envoyproxy/ratelimit:0482748e` (고정 태그)
+6. **대형 CRD**
+   - `envoyproxies.gateway.envoyproxy.io`는 JSON 기준 약 649 KB → client-side apply 시 `last-applied-configuration` 한도(262,144 bytes) 초과 → **반드시 `--server-side`**
 
 ---
 
 ## 3. 차트 구조와 설치 흐름
 
-### 3.1 gateway-helm v1.9.2 구성
+### 3.1 gateway-helm 1.9.2 구성
 
 ```mermaid
+%%{init: {'themeVariables': {'fontSize': '16px'}}}%%
 flowchart TB
-  subgraph GH["gateway-helm v1.9.2"]
+  subgraph GH["gateway-helm 1.9.2  (appVersion v1.9.2)"]
     direction TB
-    subgraph SUB["subchart: crds  (condition: crds.enabled)"]
-      C1["crds/ : Gateway API CRD<br/>v1.6.1 experimental"]
-      C2["crds/ : EG CRD<br/>(gateway.envoyproxy.io)"]
-      V["template: safe-upgrades<br/>VAP + Binding"]
+    subgraph SUB["subchart: crds  —  condition: crds.enabled"]
+      C1["crds/gatewayapi-crds.yaml<br/>Gateway API v1.6.1 experimental · 13종"]
+      C2["crds/generated/*.yaml<br/>EG CRD · 8종"]
+      V["templates/gatewayapi-safe-upgrade-policy.yaml<br/>VAP + Binding<br/>(lookup: 없거나 같은 릴리스 소유일 때만)"]
     end
-    H["hook Job: certgen<br/>(envoy-gateway / envoy /<br/>envoy-rate-limit Secret 생성)"]
-    D["Deployment: envoy-gateway<br/>ConfigMap: EnvoyGateway 설정<br/>Service, RBAC, topology injector"]
+    subgraph HK["hooks  —  pre-install, pre-upgrade"]
+      H1["weight -1<br/>certgen SA · Role · RoleBinding<br/>ClusterRole · ClusterRoleBinding<br/>MutatingWebhookConfiguration"]
+      H2["weight 0<br/>certgen Job"]
+    end
+    D["일반 리소스<br/>ServiceAccount · ConfigMap · RBAC<br/>Service · Deployment envoy-gateway<br/>(PDB · HPA · Namespace 조건부)"]
   end
-  H --> D
+  H1 --> H2 --> D
   style GH fill:#d4edda,stroke:#2e7d32,stroke-width:2px,color:#1b5e20
   style SUB fill:#a5d6a7,stroke:#2e7d32,color:#1b5e20
+  style HK fill:#a5d6a7,stroke:#2e7d32,color:#1b5e20
   classDef box fill:#ffffff,stroke:#2e7d32,color:#1b1b1b
-  class C1,C2,V,H,D box
+  class C1,C2,V,H1,H2,D box
 ```
 
-### 3.2 CRD 관리 방식 비교
+### 3.2 번들 CRD 인벤토리
 
-| 항목 | A. 차트 번들 그대로 (`crds.enabled=true`) | **B. 분리 관리 (본 환경 기본)** |
+| 그룹 | CRD | 서빙 버전 (storage 굵게) |
 |---|---|---|
-| 적용 수단 | Helm `crds/` 디렉터리 | `gateway-crds-helm` → `kubectl apply --server-side` |
-| CRD가 이미 있을 때 | **건너뜀** (구버전 유지) | 갱신 |
-| `helm upgrade` 시 CRD | 갱신 안 됨 | 수동 단계로 명시적 갱신 |
-| VAP | gateway-helm 릴리스가 소유 | Helm 외부 관리 (또는 미설치) |
-| 적합한 경우 | Gateway API CRD가 **전혀 없는** 신규 클러스터 | Cilium 등 다른 컨트롤러가 CRD를 이미 쓰는 클러스터 |
+| gateway.networking.k8s.io | gatewayclasses, gateways, httproutes | **v1**, v1beta1 |
+| | grpcroutes, listenersets | **v1** |
+| | referencegrants | v1, **v1beta1** |
+| | backendtlspolicies | **v1**, v1alpha3(deprecated) |
+| | tcproutes, udproutes | **v1**, v1alpha2(deprecated) |
+| | tlsroutes | **v1**, v1alpha2(deprecated), v1alpha3(deprecated) |
+| gateway.networking.x-k8s.io | xbackends, xbackendtrafficpolicies, xmeshes | **v1alpha1** |
+| gateway.envoyproxy.io | backends, backendtrafficpolicies, clienttrafficpolicies, envoyextensionpolicies, envoypatchpolicies, envoyproxies, httproutefilters, securitypolicies | **v1alpha1** |
 
-> 본 스택은 Cilium operator가 기동 전에 Gateway API CRD를 요구하므로, 신규 클러스터에서도 사실상 B가 기본이다.
+- Gateway API 13종 모두 `bundle-version: v1.6.1`, `channel: experimental` 어노테이션 보유
+- VAP 규칙은 `spec.group == gateway.networking.k8s.io`(10종)에만 적용. `x-k8s.io`·EG CRD는 대상 아님
 
 ### 3.3 설치 흐름
 
 ```mermaid
 %%{init: {'themeVariables': {'fontSize': '20px'}, 'flowchart': {'nodeSpacing': 40, 'rankSpacing': 50}}}%%
 flowchart TB
-  P0["Phase 0 — 사전 점검 / 백업"] --> P1["Phase 1 — 차트 pull / 번들 확인"]
-  P1 --> G{"TLSRoute v1alpha2<br/>served?"}
-  G -- "Yes (Go)" --> P2["Phase 2 — CRD SSA 적용"]
+  P0["Phase 0 — 사전 점검 / 백업"] --> P1["Phase 1 — 차트 확보 / 번들 비교"]
+  P1 --> G{"번들 TLSRoute<br/>v1alpha2 served?"}
   G -- "No (No-Go)" --> X["중단<br/>Cilium 1.20 선행 또는<br/>Cilium Gateway 비활성화"]
-  P2 --> P5a["Cilium operator 상태 확인"]
-  P5a --> P3["Phase 3 — helm install<br/>crds.enabled=false"]
+  G -- "Yes (Go)" --> E{"클러스터에<br/>Gateway API CRD 존재?"}
+  E -- "Yes (본 환경)" --> P2["Phase 2 — 번들 CRD 선적용<br/>kubectl apply --server-side -R<br/>(VAP 없는 상태에서)"]
+  P2 --> CK["Cilium operator 상태 확인"]
+  CK --> P3["Phase 3 — helm install<br/>(crds/ 21종 전부 Skip,<br/>VAP는 릴리스가 생성)"]
+  E -- "No (신규 클러스터)" --> P3N["Phase 3 — helm install<br/>(Helm이 CRD 21종 생성)"]
   P3 --> P4["Phase 4 — 스모크 테스트"]
+  P3N --> P4
   P4 --> P5["Phase 5 — Cilium 공존 검증"]
   style X fill:#fde2e2,stroke:#c0392b
 ```
 
 ---
 
-## 4. Phase 0 — 사전 점검
+## 4. gateway-helm 설치 시 내부 동작
 
-### 4.1 도구 / 접근
+### 4.1 `helm install` 단계별 시퀀스
+
+```mermaid
+%%{init: {'themeVariables': {'fontSize': '16px'}, 'sequence': {'actorFontSize': 16, 'messageFontSize': 15, 'noteFontSize': 15}}}%%
+sequenceDiagram
+  autonumber
+  participant H as helm (작업자)
+  participant A as kube-apiserver
+  participant J as certgen Job
+  participant C as envoy-gateway
+  H->>H: 차트 로드, crds.enabled=true → 서브차트 crds 포함
+  H->>A: crds/ 21종 CREATE (이미 있으면 Skip)
+  H->>A: CRD Established 대기 / discovery 갱신
+  H->>A: 템플릿 렌더링 중 lookup(VAP)
+  H->>A: 릴리스 Secret 생성 (pending-install)
+  H->>A: hook weight -1 — certgen RBAC, MutatingWebhookConfiguration
+  H->>A: hook weight 0 — certgen Job
+  A->>J: Pod 실행
+  J->>A: Secret envoy-gateway / envoy / envoy-rate-limit 생성
+  J->>A: webhook caBundle 패치
+  H->>A: Job 완료 대기 (--timeout 적용)
+  H->>A: 일반 리소스 생성 (SA, ConfigMap, RBAC, Service, Deployment, VAP …)
+  H->>A: --wait 시 Deployment Ready 대기
+  H->>A: 릴리스 Secret deployed
+  C->>A: CRD watch 시작, GatewayClass reconcile
+```
+
+단계별 의미:
+
+| # | 단계 | 실패 시 증상 | 참조 |
+|---|---|---|---|
+| 2 | CRD 생성 | 기존 CRD는 **에러 없이 Skip** → 버전 혼재 | C-01 |
+| 4 | lookup(VAP) | 외부 VAP 존재 시 VAP 미렌더링 (조용함) | 4.3 |
+| 6~10 | hook | `failed pre-install: ... job ... failed` | H-04 |
+| 11 | 일반 리소스 | `invalid ownership metadata`, VAP API 없음 | H-03, C-08 |
+| 12 | --wait | `context deadline exceeded` | H-06 |
+| 14 | 컨트롤러 기동 | CrashLoop `no matches for kind` | R-02 |
+
+### 4.2 Helm의 `crds/` 처리 규칙
+
+| 동작 | `crds/` 디렉터리 CRD |
+|---|---|
+| `helm install` | 없으면 CREATE, **있으면 Skip** (Helm 3 `--debug` 로그: `CRD <name> is already present. Skipping.`) |
+| `helm install --skip-crds` | 전부 건너뜀 (VAP 템플릿은 여전히 렌더링) |
+| `helm upgrade` | **처리 안 함** |
+| `helm uninstall` | **삭제 안 함** |
+| `helm template` | 기본 미출력 (`--include-crds` 시 출력) |
+| `crds.enabled=false` | 서브차트 전체 제외 → CRD·VAP 모두 미처리 |
+
+→ 기존 CRD가 있는 클러스터에서 "번들 CRD로 설치"하려면, **같은 파일을 kubectl로 먼저 적용**하고 Helm의 CRD 단계는 전부 Skip되게 만드는 것이 유일하게 일관된 방법이다.
+
+### 4.3 safe-upgrades VAP 동작
+
+렌더링 조건 (템플릿 발췌 요약):
+
+```text
+safeUpgradePolicy.enabled == true
+AND (VAP 없음 OR VAP가 managed-by=Helm & release-name/namespace 일치)
+AND (Binding 없음 OR Binding이 같은 조건)
+```
+
+| 상황 | 결과 |
+|---|---|
+| VAP 없음 | 릴리스가 VAP·Binding 생성 (uninstall 시 함께 삭제) |
+| 같은 릴리스 소유 VAP | 계속 관리 |
+| 외부(kubectl, 다른 릴리스) VAP | **렌더링 생략** → 릴리스는 VAP를 관리하지 않음 |
+| `helm template` / 클라이언트 dry-run | lookup이 항상 빈 값 → **항상 렌더링된 것처럼 보임** (실제 설치와 다를 수 있음) |
+
+거부 메시지 (차트 원문):
+
+```text
+규칙 1: Installing experimental CRDs on top of standard channel CRDs is prohibited by default.
+        Uninstall ValidatingAdmissionPolicy safe-upgrades.gateway.networking.k8s.io to install
+        experimental CRDs on top of standard channel CRDs.
+규칙 2: Installing CRDs with version other than v0.0.0-dev or v1.5+ is prohibited by default.
+        Uninstall ValidatingAdmissionPolicy safe-upgrades.gateway.networking.k8s.io to install other versions.
+```
+
+- 규칙 1은 **UPDATE에만** 걸림(`oldObject == null`이면 통과) → 신규 CREATE는 허용
+- 규칙 2는 CREATE에도 걸림 → VAP 존재 후 v1.4.x CRD를 새로 만드는 것도 거부 (예: Cilium 문서의 v1.4.1 TLSRoute 단독 설치)
+
+### 4.4 생성 리소스 인벤토리 (release=`eg`, ns=`envoy-gateway-system`)
+
+| 구분 | 리소스 | 이름 | uninstall 시 |
+|---|---|---|---|
+| CRD (Helm `crds/`) | CRD 21종 | §3.2 | **남음** |
+| Hook (-1) | ServiceAccount / Role / RoleBinding | `eg-gateway-helm-certgen` | **남음** |
+| Hook (-1) | ClusterRole / ClusterRoleBinding | `eg-gateway-helm-certgen:envoy-gateway-system` | **남음** |
+| Hook (-1) | MutatingWebhookConfiguration | `envoy-gateway-topology-injector.envoy-gateway-system` | **남음** |
+| Hook (0) | Job | `eg-gateway-helm-certgen` (Pod 라벨 `app=certgen`, TTL 30s) | TTL로 자동 삭제 |
+| certgen 생성 | Secret | `envoy-gateway`, `envoy`, `envoy-rate-limit` (+ 필요 시 추가 Secret) | **남음** |
+| 릴리스 | ServiceAccount | `envoy-gateway` | 삭제 |
+| 릴리스 | ConfigMap | `envoy-gateway-config` (EnvoyGateway 설정) | 삭제 |
+| 릴리스 | ClusterRole / ClusterRoleBinding | `eg-gateway-helm-envoy-gateway-role` / `-rolebinding` | 삭제 |
+| 릴리스 | Role / RoleBinding | `eg-gateway-helm-infra-manager`, `eg-gateway-helm-leader-election-role(binding)` | 삭제 |
+| 릴리스 | Service | `envoy-gateway` (ClusterIP: 18000, 18001, 18002, 19001, 9443) | 삭제 |
+| 릴리스 | Deployment | `envoy-gateway` | 삭제 |
+| 릴리스 (조건부) | PDB / HPA / Namespace | `minAvailable≥1` / `hpa.enabled` / `createNamespace` | 삭제 |
+| 릴리스 (서브차트) | VAP / Binding | `safe-upgrades.gateway.networking.k8s.io` | 삭제 |
+| 컨트롤러 생성 | Envoy Deployment, Service, ServiceAccount 등 | `envoy-<gw-ns>-<gw-name>-<hash>` | Gateway 삭제 시 정리, **먼저 uninstall하면 남음** |
+
+참고:
+- hook은 기본 삭제 정책이 `before-hook-creation` → 재설치·업그레이드 시 기존 hook 리소스를 지우고 다시 생성
+- `--create-namespace`로 만든 네임스페이스는 릴리스 소유가 아님 → uninstall 후에도 남음
+- Deployment·SA·Service·ConfigMap 이름이 **고정**(`envoy-gateway`) → 한 네임스페이스에 EG 릴리스는 하나만 가능
+
+### 4.5 이미지 결정 로직 (`_helpers.tpl`)
+
+| 대상 | 결정 순서 | 기본값 |
+|---|---|---|
+| envoy-gateway, certgen, Envoy Pod의 shutdown-manager | `deployment.envoyGateway.image.repository` → `global.images.envoyGateway.image`의 첫 경로 요소를 `global.imageRegistry`로 치환 | `docker.io/envoyproxy/gateway:v1.9.2` |
+| ratelimit | `global.images.ratelimit.image`의 레지스트리를 `global.imageRegistry`로 치환 | `docker.io/envoyproxy/ratelimit:0482748e` |
+| Envoy 데이터플레인 | `global.images.envoyProxy.image`가 **비어 있지 않을 때만** ConfigMap에 주입, 레지스트리 치환 | 비어 있음 → 컨트롤러 내장 기본값 사용 |
+
+예: `global.imageRegistry=harbor.lab.example/dockerhub-proxy`
+→ `harbor.lab.example/dockerhub-proxy/envoyproxy/gateway:v1.9.2`
+
+### 4.6 `helm upgrade` 시 동작
+
+- CRD: 처리 안 함 → **업그레이드 전 새 차트의 `crds/`를 kubectl로 먼저 적용** (13장)
+- hook: certgen RBAC·webhook·Job 재생성, certgen은 기존 Secret을 덮어쓰지 않음
+- VAP: 릴리스 소유면 갱신, 외부 소유면 계속 생략
+
+---
+
+## 5. Phase 0 — 사전 점검
+
+### 5.1 도구 / 접근
 
 ```bash
 helm version --short          # OCI 차트: Helm 3.8 이상
-kubectl version               # client/server 확인
+kubectl version
 kubectl config current-context
 kubectl get nodes -o wide
 ```
 
-### 4.2 기존 Gateway API CRD 상태
-
-```bash
-# 번들 버전 / 채널
-kubectl get crd -o custom-columns='NAME:.metadata.name,BUNDLE:.metadata.annotations.gateway\.networking\.k8s\.io/bundle-version,CHANNEL:.metadata.annotations.gateway\.networking\.k8s\.io/channel' \
-  | grep -E 'NAME|gateway\.networking\.(x-)?k8s\.io'
-
-# 저장 버전 (CRD에서 버전이 빠질 때 문제 원인이 됨 → T-05)
-kubectl get crd -o custom-columns='NAME:.metadata.name,STORED:.status.storedVersions' \
-  | grep -E 'NAME|gateway\.networking\.(x-)?k8s\.io'
-```
-
-### 4.3 VAP / 기존 EG 흔적
+### 5.2 VAP / 기존 EG 흔적
 
 ```bash
 kubectl get validatingadmissionpolicy,validatingadmissionpolicybinding 2>/dev/null | grep -i safe-upgrades
 helm list -A -a | grep -iE 'gateway|eg'
-kubectl get crd | grep gateway.envoyproxy.io
-kubectl get ns ${EG_NS} 2>/dev/null
+kubectl get crd | grep -c gateway.envoyproxy.io
+kubectl -n ${EG_NS} get deploy,svc,cm,sa 2>/dev/null | grep envoy-gateway
+kubectl get mutatingwebhookconfiguration | grep envoy-gateway
 ```
 
 | 결과 | 판단 |
 |---|---|
-| VAP 없음 + CRD v1.4.1 standard | 정상 (Phase 2에서 experimental 전환 가능) |
-| VAP 있음 + CRD standard | standard→experimental 전환이 거부됨 → [T-04](#t-04-vap가-crd-적용을-거부) 절차 필요 |
-| 기존 EG 릴리스/CRD 잔존 | 이전 시도 흔적. `helm status`로 상태 확인 후 진행 ([T-07](#t-07-cannot-re-use-a-name-that-is-still-in-use), [T-08](#t-08-another-operation-is-in-progress)) |
+| VAP 없음, EG 흔적 없음 | 정상 |
+| VAP 있음 + Gateway API CRD가 standard | Phase 2가 규칙 1로 거부됨 → **C-02** 먼저 |
+| EG 릴리스/리소스 잔존 | 이전 시도 흔적 → **H-01, H-02, H-03** 확인 후 정리 |
 
-### 4.4 Cilium 현재 상태 (기준선 기록)
+### 5.3 Cilium 기준선
 
 ```bash
 kubectl -n kube-system get cm cilium-config -o jsonpath='{.data.enable-gateway-api}{"\n"}'
 kubectl -n kube-system get deploy cilium-operator
 kubectl get gatewayclass
 kubectl get gateway,httproute -A
-# 이후 비교를 위해 operator 로그 기준선 저장
 kubectl -n kube-system logs deploy/cilium-operator --since=30m > ${WORKDIR}/backup/cilium-operator-before.log
 ```
 
-### 4.5 백업
+### 5.4 백업
 
 ```bash
 kubectl get crd -o name | grep -E 'gateway\.networking\.(x-)?k8s\.io|gateway\.envoyproxy\.io' \
   | xargs -r kubectl get -o yaml > ${WORKDIR}/backup/crds-before.yaml
-
 kubectl get gatewayclass,gateway,httproute,grpcroute,referencegrant -A -o yaml \
   > ${WORKDIR}/backup/gwapi-resources-before.yaml 2>/dev/null
 ```
 
-### 4.6 체크리스트
+### 5.5 체크리스트
 
 - [ ] 대상 클러스터 컨텍스트 확인 (운영 클러스터 아님)
-- [ ] 변경 작업(Phase 2 CRD 적용, Phase 3 helm install) 실행 직전 대상 클러스터·네임스페이스·변경 내용 요약 후 승인
+- [ ] Phase 2(CRD 적용), Phase 3(helm install) 실행 직전 대상 클러스터·네임스페이스·변경 내용 요약 후 승인
 - [ ] CRD / Gateway API 리소스 백업 완료
 - [ ] Cilium operator 로그 기준선 저장
 
 ---
 
-## 5. Phase 1 — 차트 확보 및 번들 확인
+## 6. Phase 1 — 차트 확보 및 번들 비교
 
-### 5.1 차트 pull
+### 6.1 차트 확보 및 압축 해제
 
 ```bash
 cd ${WORKDIR}
-helm pull oci://docker.io/envoyproxy/gateway-helm      --version ${EG_VERSION}
-helm pull oci://docker.io/envoyproxy/gateway-crds-helm --version ${EG_VERSION}
-tar -xzf gateway-helm-${EG_VERSION}.tgz
-ls -1 *.tgz
-helm show chart gateway-helm-${EG_VERSION}.tgz | grep -E '^(name|version|appVersion)'
+helm pull oci://docker.io/envoyproxy/gateway-helm --version ${EG_VERSION}   # 또는 반입한 tgz 복사
+export CHART_TGZ=$(ls ${WORKDIR}/gateway-helm-*.tgz | head -1); echo ${CHART_TGZ}
+tar -xzf ${CHART_TGZ}
+export CHART_DIR=${WORKDIR}/gateway-helm
+export CRD_DIR=${CHART_DIR}/charts/crds/crds
+
+grep -E '^(version|appVersion):' ${CHART_DIR}/Chart.yaml       # version: 1.9.2 / appVersion: v1.9.2
+cat ${CHART_DIR}/Chart.lock                                     # dependency crds 0.0.0
 ```
 
-- 버전 태그는 **`v` 접두사 포함** (`v1.9.2`)
-- 레지스트리 프록시로 차트를 받는 경우 `oci://` 경로만 교체. 폐쇄망이면 tgz를 반입해 로컬 파일로 설치
+- tgz 파일명은 Chart.yaml의 `version`을 따르므로 `gateway-helm-1.9.2.tgz` 형태일 수 있음 → 위처럼 `ls`로 잡아 사용
 
-### 5.2 번들 CRD 버전 확인
+### 6.2 번들 확인
 
 ```bash
-# gateway-helm 번들 (subchart crds/)
-grep -rhoE 'gateway\.networking\.k8s\.io/(bundle-version|channel): *[^ ]+' gateway-helm/charts/crds/crds/ | sort | uniq -c
+find ${CRD_DIR} -name '*.yaml' | sort                            # gatewayapi-crds.yaml + generated/ 8개
+grep -rhE '^  name: ' ${CRD_DIR} | wc -l                         # 21
+grep -rhoE 'gateway\.networking\.k8s\.io/(bundle-version|channel): *[^ ]+' ${CRD_DIR} | sort | uniq -c
+#   13 ... bundle-version: v1.6.1
+#   13 ... channel: experimental
 ```
 
-기대값: `bundle-version: v1.6.1`, `channel: experimental`
+### 6.3 Go/No-Go — TLSRoute 서빙 버전
+
+```bash
+awk '/^---/{p=0} /^  name: tlsroutes\.gateway\.networking\.k8s\.io/{p=1}
+     p && /^    (name: v|served:|storage:)/' ${CRD_DIR}/gatewayapi-crds.yaml
+```
+
+- 1.9.2 차트 기준 결과: `v1`(storage) / `v1alpha2` served / `v1alpha3` served → **Go**
+- 다른 차트 버전으로 갱신할 때마다 이 단계를 반복 (v1alpha2가 빠지면 Cilium 1.19 유지 불가)
+
+### 6.4 클러스터 대비 차이 (어떤 CRD가 Skip/신규/갱신 대상인지)
+
+```bash
+for crd in $(grep -rhE '^  name: ' ${CRD_DIR} | awk '{print $2}' | sort); do
+  if kubectl get crd "$crd" >/dev/null 2>&1; then
+    b=$(kubectl get crd "$crd" -o jsonpath='{.metadata.annotations.gateway\.networking\.k8s\.io/bundle-version}')
+    c=$(kubectl get crd "$crd" -o jsonpath='{.metadata.annotations.gateway\.networking\.k8s\.io/channel}')
+    s=$(kubectl get crd "$crd" -o jsonpath='{.status.storedVersions}')
+    printf '%-55s EXISTS bundle=%-7s channel=%-12s stored=%s\n' "$crd" "${b:--}" "${c:--}" "$s"
+  else
+    printf '%-55s NEW\n' "$crd"
+  fi
+done | tee ${WORKDIR}/logs/crd-diff-before.txt
+```
+
+해석:
+- `EXISTS`: helm install만 하면 **Skip되어 구버전으로 남는 CRD** → Phase 2에서 갱신
+- `NEW`: Phase 2(또는 helm install)에서 생성
+- `stored`에 번들이 서빙하지 않는 버전이 있으면 C-07
 
 ---
 
-## 6. Phase 2 — CRD 적용 (Helm 외부)
+## 7. Phase 2 — 번들 CRD 선적용
 
-### 6.1 렌더링
+> 클러스터에 Gateway API CRD가 하나도 없는 신규 클러스터는 이 단계를 생략하고 Phase 3에서 Helm이 생성하게 둔다.
+
+### 7.1 전제 조건
 
 ```bash
-helm template eg-crds ${WORKDIR}/gateway-crds-helm-${EG_VERSION}.tgz \
-  --set crds.gatewayAPI.enabled=true \
-  --set crds.gatewayAPI.channel=experimental \
-  --set crds.envoyGateway.enabled=true \
-  > ${WORKDIR}/rendered/eg-crds-${EG_VERSION}.yaml
-
-F=${WORKDIR}/rendered/eg-crds-${EG_VERSION}.yaml
-grep -c '^kind: CustomResourceDefinition' $F
-grep -E '^kind: ValidatingAdmissionPolicy' $F || echo "VAP 미포함"
-grep -hoE 'gateway\.networking\.k8s\.io/(bundle-version|channel): *[^ ]+' $F | sort | uniq -c   # 5.2와 동일해야 함
+kubectl get validatingadmissionpolicy safe-upgrades.gateway.networking.k8s.io 2>&1 | grep -q NotFound \
+  && echo "VAP 없음 → 진행" || echo "VAP 존재 → C-02 확인"
 ```
 
-### 6.2 Go/No-Go — TLSRoute 서빙 버전 (Cilium 1.19.1 유지 조건)
+### 7.2 서버 측 사전 검증
 
 ```bash
-# yq(v4) 사용 시
-yq 'select(.kind == "CustomResourceDefinition" and .metadata.name == "tlsroutes.gateway.networking.k8s.io")
-    | .spec.versions[] | .name + " served=" + (.served|tostring) + " storage=" + (.storage|tostring)' $F
-
-# yq가 없으면 해당 CRD 블록만 눈으로 확인
-awk '/^---/{p=0} /name: tlsroutes.gateway.networking.k8s.io/{p=1} p && /^  - name: v|^    served:|^    storage:/' $F
+kubectl apply --server-side --force-conflicts --dry-run=server -R -f ${CRD_DIR}
 ```
 
-| 결과 | 판단 | 조치 |
-|---|---|---|
-| `v1alpha2 served=true` 존재 | **Go** | 6.3 진행. Phase 5에서 재확인 |
-| `v1`만 존재 (v1alpha2 없음) | **No-Go** | 아래 중 택일 후 재계획 |
+- `-R` 필수: 없으면 `generated/` 하위 EG CRD 8종이 빠짐 (C-04)
+- `--server-side` 필수: 대형 CRD (C-05)
+- `--force-conflicts`: 기존 CRD를 다른 field manager(client-side apply, Helm 등)가 소유한 경우 (C-06)
 
-No-Go 시 선택지:
-- **Cilium 1.20으로 선행 업그레이드** (Gateway API v1.6 지원 버전으로 정렬) — 권장
-- Cilium `gatewayAPI.enabled=false`로 끄고 Cilium Gateway에 붙은 Route를 EG로 이관
-- 참고: TLSRoute CRD만 빼는 방식은 EG가 해당 CRD를 watch하므로 EG 기동 실패 위험([T-14](#t-14-envoy-gateway-crashloopbackoff--no-matches-for-kind)) → 비권장
-
-> ⚠️ 2026-10 기준 이 항목은 **실측으로 확정**할 것. 결과를 이 문서의 변경 이력에 기록한다.
-
-### 6.3 서버 측 사전 검증 (dry-run)
+### 7.3 적용
 
 ```bash
-kubectl apply --server-side --force-conflicts --dry-run=server -f $F
-```
+kubectl apply --server-side --force-conflicts -R -f ${CRD_DIR} | tee ${WORKDIR}/logs/crd-apply.log
 
-- 에러가 없으면 6.4로
-- 에러 발생 시: annotation 길이 → [T-02](#t-02-metadataannotations-too-long), 충돌 → [T-03](#t-03-server-side-apply-충돌), VAP 거부 → [T-04](#t-04-vap가-crd-적용을-거부), storedVersions → [T-05](#t-05-storedversions-오류로-crd-갱신-실패)
-
-### 6.4 적용
-
-```bash
-kubectl apply --server-side --force-conflicts -f $F
-
-kubectl get crd -o name | grep -E 'gateway\.networking\.(x-)?k8s\.io|gateway\.envoyproxy\.io' \
+grep -rhE '^  name: ' ${CRD_DIR} | awk '{print "crd/"$2}' \
   | xargs kubectl wait --for=condition=Established --timeout=120s
 ```
 
-- `--force-conflicts`: 기존에 client-side apply 또는 다른 매니저가 소유한 필드를 넘겨받기 위해 필요
-- 렌더링 결과에 VAP가 포함된 경우, CRD 전환이 같은 apply 안에서 끝나므로 일반적으로 문제없음. 거부되면 [T-04](#t-04-vap가-crd-적용을-거부)
-
-### 6.5 적용 확인
+### 7.4 적용 확인
 
 ```bash
-kubectl get crd -o custom-columns='NAME:.metadata.name,BUNDLE:.metadata.annotations.gateway\.networking\.k8s\.io/bundle-version,CHANNEL:.metadata.annotations.gateway\.networking\.k8s\.io/channel,STORED:.status.storedVersions' \
-  | grep -E 'NAME|gateway\.networking\.(x-)?k8s\.io'
-
+# 6.4 스크립트 재실행 → 21종 모두 EXISTS, Gateway API 13종 bundle=v1.6.1 channel=experimental
 kubectl get crd tlsroutes.gateway.networking.k8s.io \
   -o jsonpath='{range .spec.versions[*]}{.name}{"\tserved="}{.served}{"\tstorage="}{.storage}{"\n"}{end}'
-
-kubectl get crd | grep -c gateway.envoyproxy.io
 ```
 
-### 6.6 CRD 적용 직후 Cilium 확인 (Phase 3 진행 전 게이트)
+### 7.5 Cilium 게이트 (Phase 3 진행 전)
 
 ```bash
 kubectl -n kube-system logs deploy/cilium-operator --since=5m | grep -iE 'gateway|tlsroute|crd|error' | tail -50
@@ -302,27 +432,25 @@ kubectl get gatewayclass
 kubectl get gateway -A
 ```
 
-- 이상 징후가 없으면 Phase 3
-- operator 오류 → [T-06](#t-06-crd-갱신-후-cilium-operator-오류)
+- 이상 없음 → Phase 3
+- operator 오류 → CI-01
 
 ---
 
-## 7. Phase 3 — gateway-helm 설치
+## 8. Phase 3 — helm install
 
-### 7.1 values 작성 (`eg-values.yaml`)
+### 8.1 values (`eg-values.yaml`)
 
 ```yaml
-# eg-values.yaml — EG v1.9.2
+# eg-values.yaml — gateway-helm 1.9.2
 global:
+  # 아래 3종 이미지의 레지스트리를 일괄 치환 (envoyGateway / ratelimit / envoyProxy)
+  imageRegistry: harbor.lab.example/dockerhub-proxy
   images:
-    envoyGateway:
-      image: harbor.lab.example/dockerhub-proxy/envoyproxy/gateway:v1.9.2
     envoyProxy:
-      # EG 1.9 호환 Envoy: distroless-v1.39.x (호환성 매트릭스에서 정확한 패치 확인)
-      image: harbor.lab.example/dockerhub-proxy/envoyproxy/envoy:<distroless-v1.39.x>
-    ratelimit:
-      # 기본값이 :master 태그이므로 고정 태그로 지정 (rate limit 사용 시에만 배포됨)
-      image: harbor.lab.example/dockerhub-proxy/envoyproxy/ratelimit:<pinned-tag>
+      # 비워 두면 imageRegistry가 데이터플레인에 적용되지 않음 (컨트롤러 내장 docker.io 기본값 사용)
+      # 태그는 차트 헬퍼 기본값 distroless-v1.39.1. 호환성 매트릭스로 재확인
+      image: docker.io/envoyproxy/envoy:distroless-v1.39.1
 
 deployment:
   replicas: 2
@@ -331,60 +459,80 @@ config:
   envoyGateway:
     logging:
       level:
-        default: info        # 문제 분석 시 debug
+        default: info          # 문제 분석 시 debug
 
 certgen:
   job:
     ttlSecondsAfterFinished: 600   # 기본 30초 → 실패 시 로그 확인 시간 확보
 ```
 
-- 레지스트리 경로·태그는 환경에 맞게 교체
-- `global.imageRegistry`로 일괄 치환도 가능하나, 이미지별 결과는 반드시 7.2에서 확인
+- `crds.enabled`는 기본값(`true`) 유지 → Helm CRD 단계는 Skip되고 VAP는 릴리스가 생성
+- Phase 2에서 CRD를 이미 적용했으므로 Helm이 새로 만들 CRD는 없음. 누락된 CRD가 있으면 같은 번들로 Helm이 채움
 
-### 7.2 렌더링 / 사전 검증
+### 8.2 렌더링 점검
 
 ```bash
-cd ${WORKDIR}
-helm template ${EG_RELEASE} gateway-helm-${EG_VERSION}.tgz -n ${EG_NS} \
-  -f eg-values.yaml --set crds.enabled=false > rendered/eg-${EG_VERSION}.yaml
+helm template ${EG_RELEASE} ${CHART_TGZ} -n ${EG_NS} -f eg-values.yaml \
+  > ${WORKDIR}/rendered/eg-${EG_VERSION}.yaml
+R=${WORKDIR}/rendered/eg-${EG_VERSION}.yaml
 
-grep -E '^\s+image:' rendered/eg-${EG_VERSION}.yaml | sort -u        # 이미지 경로 확인
-grep -c '^kind: CustomResourceDefinition' rendered/eg-${EG_VERSION}.yaml   # 0 이어야 함
-grep -E '^kind: ValidatingAdmissionPolicy' rendered/eg-${EG_VERSION}.yaml || echo "VAP 미포함(정상)"
-grep -E 'envoyProxy|image' rendered/eg-${EG_VERSION}.yaml | grep -i envoy | sort -u   # envoyProxy 이미지 반영 확인
-
-helm install ${EG_RELEASE} gateway-helm-${EG_VERSION}.tgz -n ${EG_NS} --create-namespace \
-  -f eg-values.yaml --set crds.enabled=false --dry-run=server > /dev/null && echo "dry-run OK"
+grep -E '^kind:' $R | sort | uniq -c                       # 리소스 종류
+grep -E '^\s+image:' $R | sort -u                          # envoy-gateway / certgen 이미지
+sed -n '/name: envoy-gateway-config/,/^---/p' $R | grep -E 'image:'   # envoyProxy, ratelimit, shutdownManager 이미지
+grep -c 'kind: CustomResourceDefinition' $R                # 0 (crds/는 template에 미포함)
 ```
 
-### 7.3 설치
+- `helm template`은 lookup이 비어 있어 VAP가 **항상** 출력됨 → 실제 렌더링 여부는 8.3 서버 dry-run으로 확인
+
+### 8.3 서버 측 dry-run
 
 ```bash
-helm install ${EG_RELEASE} gateway-helm-${EG_VERSION}.tgz \
+helm install ${EG_RELEASE} ${CHART_TGZ} -n ${EG_NS} --create-namespace \
+  -f eg-values.yaml --dry-run=server > ${WORKDIR}/rendered/eg-dryrun-server.yaml \
+  && grep -c 'kind: ValidatingAdmissionPolicy' ${WORKDIR}/rendered/eg-dryrun-server.yaml
+```
+
+- `1`이면 릴리스가 VAP를 생성, `0`이면 외부 VAP가 이미 있어 생략 (4.3)
+
+### 8.4 설치
+
+```bash
+helm install ${EG_RELEASE} ${CHART_TGZ} \
   -n ${EG_NS} --create-namespace \
   -f eg-values.yaml \
-  --set crds.enabled=false \
-  --wait --timeout 5m
+  --wait --timeout 10m --debug 2>&1 | tee ${WORKDIR}/logs/helm-install.log
+
+grep -c 'already present. Skipping' ${WORKDIR}/logs/helm-install.log   # 기존 CRD 환경: 21 (Helm 3 로그 기준)
 ```
 
-- 실패 시 `--debug`를 붙여 재현하고 [10장](#10-트러블슈팅) 참조
-- 재시도는 `helm upgrade --install` 사용 (같은 이름 재사용 오류 방지)
+- `--timeout`은 certgen hook 대기와 `--wait` 모두에 적용
+- 재시도는 `helm upgrade --install`
 
-### 7.4 설치 확인
+### 8.5 설치 확인
 
 ```bash
 helm status ${EG_RELEASE} -n ${EG_NS}
-kubectl -n ${EG_NS} get deploy,pod,svc,job -o wide
-kubectl -n ${EG_NS} get secret envoy-gateway envoy envoy-rate-limit   # certgen 결과 (이름만 확인)
-kubectl -n ${EG_NS} wait --for=condition=Available deploy/envoy-gateway --timeout=5m
+helm get hooks ${EG_RELEASE} -n ${EG_NS} | grep -E '^kind:|^  name:'
+helm get manifest ${EG_RELEASE} -n ${EG_NS} | grep -E '^kind:' | sort | uniq -c
+
+kubectl -n ${EG_NS} get deploy,pod,svc -o wide
+kubectl -n ${EG_NS} get secret envoy-gateway envoy envoy-rate-limit          # certgen 결과 (이름만)
+kubectl get mutatingwebhookconfiguration envoy-gateway-topology-injector.${EG_NS} \
+  -o jsonpath='{.webhooks[0].clientConfig.caBundle}' | wc -c                   # 0보다 커야 함 (certgen 패치)
+kubectl get validatingadmissionpolicy safe-upgrades.gateway.networking.k8s.io \
+  -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by} {.metadata.annotations.meta\.helm\.sh/release-name}{"\n"}'
 kubectl -n ${EG_NS} logs deploy/envoy-gateway --since=10m | grep -iE 'error|fail' | head -20
+
+# 릴리스 Secret 크기 (1 MiB 제한 대비)
+kubectl -n ${EG_NS} get secret -l owner=helm,name=${EG_RELEASE} \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.data.release}{"\n"}{end}' | awk '{print $1, length($2)}'
 ```
 
 ---
 
-## 8. Phase 4 — 설치 검증 (스모크 테스트)
+## 9. Phase 4 — 스모크 테스트
 
-테스트용 네임스페이스에 임시 리소스를 만들고 끝나면 삭제한다.
+테스트 네임스페이스에 임시 리소스를 만들고 끝나면 삭제한다.
 
 ```yaml
 # eg-smoke.yaml
@@ -452,29 +600,28 @@ kubectl -n eg-smoke expose deployment echo --port 80
 
 kubectl get gatewayclass eg -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}{"\n"}'   # True
 kubectl -n eg-smoke wait --for=condition=Programmed gateway/smoke --timeout=10m
-kubectl -n eg-smoke get gateway smoke -o wide
-kubectl -n eg-smoke get httproute echo -o jsonpath='{.status.parents[*].conditions[*].type}={.status.parents[*].conditions[*].status}{"\n"}'
+
+# 컨트롤러가 만든 데이터플레인 리소스 (EG 네임스페이스)
+kubectl -n ${EG_NS} get deploy,svc,sa -l gateway.envoyproxy.io/owning-gateway-name=smoke
+kubectl -n ${EG_NS} get deploy -l gateway.envoyproxy.io/owning-gateway-name=smoke \
+  -o jsonpath='{range ..containers[*]}{.name}{"\t"}{.image}{"\n"}{end}'   # envoy + shutdown-manager 이미지
 
 GW=$(kubectl -n eg-smoke get gateway smoke -o jsonpath='{.status.addresses[0].value}')
 for i in $(seq 1 20); do curl -s -o /dev/null -w '%{http_code}\n' http://${GW}/; done | sort | uniq -c
 ```
 
-- 20회 모두 `200`이어야 함. 일부만 실패하면 [T-16](#t-16-gateway-programmedfalse--service-external-ip-pending)의 ETP/헬스모니터 항목 확인
-- 사용한 Envoy 이미지 실제 값 확인:
-  ```bash
-  kubectl -n ${EG_NS} get deploy -l gateway.envoyproxy.io/owning-gateway-name=smoke -o jsonpath='{..image}{"\n"}'
-  ```
+- 20회 모두 `200`이어야 함. 일부만 실패하면 R-04
+- Envoy Pod 이미지가 `docker.io/...`로 나오면 8.1의 `global.images.envoyProxy.image` 누락 (R-01)
 
 정리:
 
 ```bash
-kubectl delete ns eg-smoke
-# GatewayClass/EnvoyProxy를 계속 쓸 계획이 없으면 함께 삭제
+kubectl delete ns eg-smoke    # Gateway 삭제 → 컨트롤러가 Envoy 리소스와 Octavia LB 정리
 ```
 
 ---
 
-## 9. Phase 5 — Cilium 공존 검증
+## 10. Phase 5 — Cilium 공존 검증
 
 ```bash
 kubectl get gatewayclass -o custom-columns='NAME:.metadata.name,CONTROLLER:.spec.controllerName,ACCEPTED:.status.conditions[?(@.type=="Accepted")].status'
@@ -484,303 +631,255 @@ diff <(grep -iE 'error|level=warn' ${WORKDIR}/backup/cilium-operator-before.log 
      <(grep -iE 'error|level=warn' ${WORKDIR}/backup/cilium-operator-after.log  | sed 's/time=[^ ]*//' | sort -u)
 ```
 
-- Cilium GatewayClass `Accepted=True` 유지
-- 기존 Cilium Gateway의 HTTPRoute 트래픽 정상 (기존 엔드포인트로 curl)
-- operator 로그에 신규 오류 없음
-- (유지보수 시간 내) `cilium-operator` 재시작 후에도 정상 기동하는지 확인 — 기동 시점 CRD 검사에서 문제가 드러나는 경우가 있음
+- Cilium GatewayClass `Accepted=True` 유지, 기존 Cilium HTTPRoute 트래픽 정상
+- Cilium operator는 기동 시점에 Gateway API CRD 존재 여부를 판단 → 유지보수 시간 내 재시작 후에도 정상인지 확인
   ```bash
   kubectl -n kube-system rollout restart deploy/cilium-operator
   kubectl -n kube-system rollout status deploy/cilium-operator --timeout=5m
+  kubectl -n kube-system logs deploy/cilium-operator --since=5m | grep -iE 'gateway|tlsroute|error'
   ```
+- 이전에 TLSRoute CRD가 없던 환경이면, 재시작 후 Cilium이 TLSRoute 지원을 새로 활성화하므로 이 시점의 로그를 특히 확인
 
 ---
 
-## 10. 트러블슈팅
+## 11. 트러블슈팅
 
-### 10.1 빠른 분류
+### 11.1 빠른 분류
 
 ```mermaid
+%%{init: {'themeVariables': {'fontSize': '16px'}}}%%
 flowchart TB
-  S{"어디서 실패?"} --> A["helm pull"]
-  S --> B["kubectl apply (CRD)"]
-  S --> C["helm install"]
-  S --> D["설치 후 Pod/Gateway"]
-  A --> T01["T-01"]
-  B --> T02["T-02 annotation 길이"]
-  B --> T03["T-03 SSA 충돌"]
-  B --> T04["T-04 VAP 거부"]
-  B --> T05["T-05 storedVersions"]
-  B --> T06["T-06 Cilium operator"]
-  C --> T07["T-07 이름 재사용"]
-  C --> T08["T-08 pending 상태"]
-  C --> T09["T-09 ownership metadata"]
-  C --> T10["T-10 릴리스 Secret 크기"]
-  C --> T11["T-11 certgen hook"]
-  C --> T12["T-12 --wait 타임아웃"]
-  D --> T13["T-13 ImagePull"]
-  D --> T14["T-14 CrashLoop no matches"]
-  D --> T15["T-15 GatewayClass"]
-  D --> T16["T-16 LB pending / 1-in-N"]
-  D --> T17["T-17 webhook"]
-  D --> T18["T-18 TCP/UDP Route 무시"]
+  S{"어디서 실패?"}
+  S --> A["CRD 적용 (kubectl / Helm CRD 단계)"]
+  S --> B["helm install / upgrade"]
+  S --> C["설치 후 Pod / Gateway"]
+  S --> D["Cilium"]
+  A --> A1["C-01 Helm이 기존 CRD Skip → 버전 혼재<br/>C-02 VAP 규칙 1 거부<br/>C-03 VAP 규칙 2 거부<br/>C-04 EG CRD 누락 (-R)<br/>C-05 annotation 길이<br/>C-06 SSA 충돌<br/>C-07 storedVersions<br/>C-08 VAP API 없음"]
+  B --> B1["H-01 이름 재사용<br/>H-02 pending 고정<br/>H-03 ownership metadata<br/>H-04 certgen hook 실패<br/>H-05 Secret envoy-gateway 없음<br/>H-06 --wait 타임아웃"]
+  C --> C1["R-01 ImagePull<br/>R-02 CrashLoop no matches for kind<br/>R-03 GatewayClass 미승인<br/>R-04 LB pending / 1-in-N<br/>R-05 topology injector<br/>R-06 TCP/UDP Route 무시"]
+  D --> D1["CI-01 operator 오류"]
 ```
 
 공통 원칙:
-- 오류 메시지 원문을 먼저 확보 (`--debug`, `kubectl describe`, `kubectl get events --sort-by=.lastTimestamp`)
-- 아래 메시지는 **대표 형태**이며 버전에 따라 문구가 조금 다를 수 있음 → 핵심 키워드로 grep
+- 오류 원문 확보: `--debug`, `kubectl describe`, `kubectl get events --sort-by=.lastTimestamp`
+- 아래 메시지 중 VAP 메시지는 차트 원문, 나머지는 대표 형태 → 핵심 키워드로 grep
 
 ---
 
-### Phase 1 — 차트 확보
+### CRD 단계
 
-#### T-01. OCI 차트 pull 실패
+#### C-01. Helm이 기존 CRD를 Skip → 버전 혼재
 
 ```text
-Error: failed to do request: Head "https://registry-1.docker.io/v2/envoyproxy/gateway-helm/manifests/v1.9.2": dial tcp ...: i/o timeout
-Error: ... 401 Unauthorized
-Error: ... not found
+(helm --debug) CRD gateways.gateway.networking.k8s.io is already present. Skipping.
 ```
 
-- **원인**: 외부망 차단·프록시 미설정 / 레지스트리 인증 필요 / 버전 표기 오류(`1.9.2` vs `v1.9.2`)
-- **확인**: `helm show chart oci://docker.io/envoyproxy/gateway-helm --version v1.9.2`
-- **조치**
-  - 버전은 `v` 접두사 포함
-  - 레지스트리 프록시(OCI 프록시 캐시) 경로로 교체하거나, 외부망 가능한 호스트에서 `helm pull` 후 tgz 반입
-  - 인증이 필요하면 작업자가 로컬에서 `helm registry login <registry>`를 직접 수행한 뒤 재시도
+- **원인**: Phase 2 없이 `helm install` → 기존 6종 등은 v1.4.1 standard로 남고 신규 CRD만 v1.6.1로 생성. 동시에 VAP가 생성됨
+- **확인**: 6.4 스크립트 → `bundle`이 섞여 있음
+- **조치**: 이 상태에서 Phase 2를 실행하면 **C-02로 거부됨** → C-02의 "릴리스 소유 VAP" 절차로 복구
 
----
-
-### Phase 2 — CRD 적용
-
-#### T-02. `metadata.annotations: Too long`
+#### C-02. VAP 규칙 1 — standard 위 experimental 거부
 
 ```text
-The CustomResourceDefinition "httproutes.gateway.networking.k8s.io" is invalid:
+customresourcedefinitions.apiextensions.k8s.io "gateways.gateway.networking.k8s.io" is forbidden:
+ValidatingAdmissionPolicy 'safe-upgrades.gateway.networking.k8s.io' with binding 'safe-upgrades.gateway.networking.k8s.io'
+denied request: Installing experimental CRDs on top of standard channel CRDs is prohibited by default. ...
+```
+
+- **원인**: VAP가 있는 상태에서 standard CRD를 experimental로 UPDATE
+- **확인**
+  ```bash
+  kubectl get validatingadmissionpolicy safe-upgrades.gateway.networking.k8s.io \
+    -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by} {.metadata.annotations.meta\.helm\.sh/release-name}{"\n"}'
+  ```
+- **조치 A — VAP가 EG 릴리스 소유 (C-01 이후 상황)**: Helm으로 VAP를 내렸다가 다시 올림
+  ```bash
+  helm upgrade ${EG_RELEASE} ${CHART_TGZ} -n ${EG_NS} -f eg-values.yaml \
+    --set crds.gatewayAPI.safeUpgradePolicy.enabled=false --wait      # 릴리스가 VAP 삭제
+  kubectl apply --server-side --force-conflicts -R -f ${CRD_DIR}       # Phase 2
+  helm upgrade ${EG_RELEASE} ${CHART_TGZ} -n ${EG_NS} -f eg-values.yaml --wait   # VAP 재생성
+  ```
+- **조치 B — 외부 소유 VAP**: 변경 승인 후 백업 → 삭제 → Phase 2 → 백업으로 복구
+  ```bash
+  kubectl get validatingadmissionpolicy,validatingadmissionpolicybinding safe-upgrades.gateway.networking.k8s.io -o yaml \
+    > ${WORKDIR}/backup/vap-safe-upgrades.yaml
+  kubectl delete validatingadmissionpolicybinding safe-upgrades.gateway.networking.k8s.io
+  kubectl delete validatingadmissionpolicy        safe-upgrades.gateway.networking.k8s.io
+  kubectl apply --server-side --force-conflicts -R -f ${CRD_DIR}
+  kubectl apply --server-side -f ${WORKDIR}/backup/vap-safe-upgrades.yaml
+  ```
+
+#### C-03. VAP 규칙 2 — v1.5 미만 번들 거부
+
+```text
+... denied request: Installing CRDs with version other than v0.0.0-dev or v1.5+ is prohibited by default. ...
+```
+
+- **원인**: VAP 존재 후 v1.4.x CRD를 적용 (예: Cilium 문서의 v1.4.1 TLSRoute 단독 설치, 백업본 복원, 다운그레이드)
+- **조치**: 다운그레이드는 지원 경로가 아님 → 중단. TLSRoute가 필요하면 이미 번들(v1.6.1)에 포함되어 있으므로 별도 설치 불필요
+
+#### C-04. EG CRD 8종 누락
+
+```text
+(envoy-gateway 로그) ... no matches for kind "EnvoyProxy" in version "gateway.envoyproxy.io/v1alpha1"
+```
+
+- **원인**: `kubectl apply -f ${CRD_DIR}`에 `-R`을 빠뜨려 `generated/` 미적용
+- **확인**: `kubectl get crd | grep -c gateway.envoyproxy.io` → 8이어야 함
+- **조치**: `kubectl apply --server-side --force-conflicts -R -f ${CRD_DIR}` 후 `kubectl -n ${EG_NS} rollout restart deploy/envoy-gateway`
+
+#### C-05. `metadata.annotations: Too long`
+
+```text
+The CustomResourceDefinition "envoyproxies.gateway.envoyproxy.io" is invalid:
 metadata.annotations: Too long: must have at most 262144 bytes
 ```
 
-- **원인**: client-side `kubectl apply`가 `last-applied-configuration` 어노테이션에 전체 CRD를 저장
-- **조치**: `kubectl apply --server-side` 사용. 이미 어노테이션이 붙은 CRD도 SSA로 재적용하면 됨
+- **원인**: client-side apply가 `last-applied-configuration`에 CRD 전체를 저장 (envoyproxies ≈ 649 KB)
+- **조치**: `--server-side`
 
-#### T-03. server-side apply 충돌
+#### C-06. server-side apply 충돌
 
 ```text
-error: Apply failed with N conflicts: conflicts with "kubectl-client-side-apply" using apiextensions.k8s.io/v1:
-- .spec.versions
+error: Apply failed with N conflicts: conflicts with "helm" ... / conflicts with "kubectl-client-side-apply" ...
 ```
 
-- **원인**: 기존 CRD를 다른 field manager(client-side apply, 다른 도구)가 소유
-- **조치**: `--force-conflicts`로 소유권 이전. 이후 해당 CRD는 이 절차로만 관리 (다른 도구로 덮어쓰기 금지)
+- **원인**: 기존 CRD를 Helm(신규 클러스터에서 Helm이 생성한 경우) 또는 client-side apply가 소유
+- **조치**: `--force-conflicts`. 이후 CRD는 이 절차(차트 `crds/` + kubectl SSA)로만 관리
 
-#### T-04. VAP가 CRD 적용을 거부
-
-```text
-customresourcedefinitions.apiextensions.k8s.io "httproutes.gateway.networking.k8s.io" is forbidden:
-ValidatingAdmissionPolicy 'safe-upgrades.gateway.networking.k8s.io' with binding
-'safe-upgrades.gateway.networking.k8s.io' denied request: ...
-```
-
-- **원인**
-  - standard CRD가 있는 상태에서 experimental CRD 적용 시도
-  - 현재보다 오래된 번들 버전 적용 시도 (다운그레이드)
-- **확인**
-  ```bash
-  kubectl get validatingadmissionpolicy safe-upgrades.gateway.networking.k8s.io -o yaml | head -40
-  kubectl get crd gateways.gateway.networking.k8s.io -o jsonpath='{.metadata.annotations}{"\n"}'
-  ```
-- **조치**
-  - 다운그레이드 시도였다면 **중단** (CRD 다운그레이드는 지원 경로 아님)
-  - 의도된 standard → experimental 전환이라면, 변경 승인 후 VAP를 일시 제거하고 적용, 즉시 복구
-    ```bash
-    kubectl get validatingadmissionpolicy,validatingadmissionpolicybinding safe-upgrades.gateway.networking.k8s.io -o yaml \
-      > ${WORKDIR}/backup/vap-safe-upgrades.yaml
-    kubectl delete validatingadmissionpolicybinding safe-upgrades.gateway.networking.k8s.io
-    kubectl delete validatingadmissionpolicy        safe-upgrades.gateway.networking.k8s.io
-    kubectl apply --server-side --force-conflicts -f $F
-    kubectl apply --server-side -f ${WORKDIR}/backup/vap-safe-upgrades.yaml   # 또는 렌더링 결과의 VAP로 복구
-    ```
-  - VAP가 Helm 릴리스 소유였다면, 복구는 `helm upgrade`로 하는 것이 소유권 측면에서 깔끔함
-
-#### T-05. storedVersions 오류로 CRD 갱신 실패
+#### C-07. storedVersions 오류
 
 ```text
-The CustomResourceDefinition "tlsroutes.gateway.networking.k8s.io" is invalid:
 status.storedVersions[0]: Invalid value: "v1alpha2": must appear in spec.versions
 ```
 
-- **원인**: 새 CRD가 특정 버전(예: v1alpha2)을 제거했는데, etcd에 그 버전으로 저장된 객체 이력이 `status.storedVersions`에 남아 있음
-- **확인**
+- **원인**: 새 CRD가 서빙하지 않는 버전이 `status.storedVersions`에 남아 있음
+- **1.9.2 번들 기준**: 기존에 서빙되던 버전을 제거한 CRD가 없으므로 v1.4.1 → v1.6.1 전환에서는 발생하지 않는 것이 정상. 차트를 올릴 때 6.4 결과의 `stored`와 6.3 결과를 대조
+- **조치** (발생 시): 객체 재기록 → storedVersions 정리 → 재적용
   ```bash
-  kubectl get crd tlsroutes.gateway.networking.k8s.io -o jsonpath='{.status.storedVersions}{"\n"}'
-  kubectl get tlsroutes.gateway.networking.k8s.io -A
+  kubectl get <plural>.gateway.networking.k8s.io -A -o json | kubectl replace -f -
+  kubectl patch crd <plural>.gateway.networking.k8s.io --subresource=status --type=merge \
+    -p '{"status":{"storedVersions":["<현재 storage 버전>"]}}'
   ```
-- **조치**
-  - 이 상황 자체가 "v1alpha2 미서빙" 신호 → Cilium 1.19.1 유지 조건에서는 [6.2 No-Go](#62-gono-go--tlsroute-서빙-버전-cilium-1191-유지-조건)로 회귀해 재판단
-  - 진행이 결정된 경우: 기존 객체를 새 저장 버전으로 재기록 → storedVersions 정리 → CRD 재적용
-    ```bash
-    kubectl get tlsroutes.gateway.networking.k8s.io -A -o json | kubectl replace -f -
-    kubectl patch crd tlsroutes.gateway.networking.k8s.io --subresource=status --type=merge \
-      -p '{"status":{"storedVersions":["<현재 storage 버전>"]}}'
-    ```
-  - TCPRoute/UDPRoute도 동일 원리 (v1.6에서 저장 버전이 v1alpha2 → v1로 이동)
 
-#### T-06. CRD 갱신 후 Cilium operator 오류
+#### C-08. VAP API 없음
 
 ```text
-(cilium-operator 로그) ... TLSRoute ... index / no matches for kind ... / failed to ... gateway-api
-GatewayClass "cilium" Accepted 상태 이상, 기존 Cilium Gateway 트래픽 영향
+resource mapping not found for name: "safe-upgrades.gateway.networking.k8s.io" ...
+no matches for kind "ValidatingAdmissionPolicy" in version "admissionregistration.k8s.io/v1"
 ```
 
-- **원인**: Cilium 1.19.x는 Gateway API v1.4 기준으로 빌드됨. v1.5+ CRD 스키마/서빙 버전 변화(특히 TLSRoute)와 불일치
-- **확인**
-  ```bash
-  kubectl -n kube-system logs deploy/cilium-operator --since=15m | grep -iE 'gateway|tlsroute|error'
-  kubectl get crd tlsroutes.gateway.networking.k8s.io \
-    -o jsonpath='{range .spec.versions[*]}{.name}{" served="}{.served}{"\n"}{end}'
-  ```
-- **조치**
-  - CRD 롤백은 VAP·저장 버전 때문에 사실상 불가 → **전진 복구**
-  - 단기: Cilium Gateway API 비활성화(`gatewayAPI.enabled=false`) 후 해당 Route를 EG로 이관
-  - 정식: Cilium 1.20 업그레이드
-  - 이 증상이 확인되면 6.2 Go/No-Go 결과와 함께 문서 변경 이력에 기록
+- **원인**: Kubernetes 1.30 미만
+- **조치**: `--set crds.gatewayAPI.safeUpgradePolicy.enabled=false`
 
 ---
 
-### Phase 3 — helm install
+### Helm 단계
 
-#### T-07. `cannot re-use a name that is still in use`
+#### H-01. `cannot re-use a name that is still in use`
 
-```text
-Error: INSTALLATION FAILED: cannot re-use a name that is still in use
-```
+- **확인**: `helm list -n ${EG_NS} -a`, `helm history ${EG_RELEASE} -n ${EG_NS}`
+- **조치**: `failed` 상태면 `helm upgrade --install`, 폐기할 거면 `helm uninstall` 후 재설치
 
-- **원인**: 같은 이름의 릴리스(실패/삭제 대기 포함)가 존재
-- **확인**: `helm list -n ${EG_NS} -a` / `helm history ${EG_RELEASE} -n ${EG_NS}`
-- **조치**: 상태가 `failed`면 `helm upgrade --install`로 재시도, 폐기할 거면 `helm uninstall ${EG_RELEASE} -n ${EG_NS}` 후 재설치
+#### H-02. `another operation (install/upgrade/rollback) is in progress`
 
-#### T-08. `another operation ... is in progress`
-
-```text
-Error: UPGRADE FAILED: another operation (install/upgrade/rollback) is in progress
-```
-
-- **원인**: 이전 작업이 중단되어 릴리스가 `pending-install` / `pending-upgrade`에 고정
-- **확인**: `helm history ${EG_RELEASE} -n ${EG_NS}` → 마지막 리비전 STATUS
+- **원인**: 중단으로 릴리스가 `pending-install` / `pending-upgrade`에 고정 (certgen 대기 중 Ctrl+C 등)
 - **조치**
   - 이전 `deployed` 리비전이 있으면 `helm rollback ${EG_RELEASE} <rev> -n ${EG_NS}`
   - 최초 설치가 pending이면 `helm uninstall ${EG_RELEASE} -n ${EG_NS}` 후 재설치
   - 위가 안 될 때만: pending 리비전의 릴리스 Secret(`sh.helm.release.v1.${EG_RELEASE}.v<N>`)을 백업 후 삭제
 
-#### T-09. `invalid ownership metadata`
+#### H-03. `invalid ownership metadata`
 
 ```text
-Error: INSTALLATION FAILED: Unable to continue with install: ValidatingAdmissionPolicy
-"safe-upgrades.gateway.networking.k8s.io" in namespace "" exists and cannot be imported into the current release:
-invalid ownership metadata; label validation error: missing key "app.kubernetes.io/managed-by": must be set to "Helm";
-annotation validation error: missing key "meta.helm.sh/release-name": must be set to "eg"; ...
+Error: INSTALLATION FAILED: Unable to continue with install: Deployment "envoy-gateway" in namespace
+"envoy-gateway-system" exists and cannot be imported into the current release: invalid ownership metadata; ...
 ```
 
-- **원인**: 차트가 렌더링하는 리소스(VAP, CRD 등)가 Helm 외부에서 이미 생성됨
-- **조치** (택일)
-  - Helm 외부 관리 유지: `--set crds.enabled=false` (CRD+VAP 렌더링 중단)
-    - CRD는 외부, VAP만 끄려면 `--set crds.gatewayAPI.safeUpgradePolicy.enabled=false`
-  - Helm으로 넘기기: 대상 리소스에 소유권 메타데이터 부여 후 재시도
-    ```bash
-    for k in validatingadmissionpolicy validatingadmissionpolicybinding; do
-      kubectl annotate $k safe-upgrades.gateway.networking.k8s.io \
-        meta.helm.sh/release-name=${EG_RELEASE} meta.helm.sh/release-namespace=${EG_NS} --overwrite
-      kubectl label $k safe-upgrades.gateway.networking.k8s.io app.kubernetes.io/managed-by=Helm --overwrite
-    done
-    ```
-  - 네임스페이스가 원인이면 `--create-namespace`를 빼거나 기존 네임스페이스를 그대로 사용
+- **원인**: 고정 이름 리소스(`envoy-gateway` Deployment/Service/SA, `envoy-gateway-config` ConfigMap)가 다른 방식(`install.yaml`, 다른 릴리스명)으로 이미 존재
+- **참고**: VAP는 lookup으로 외부 소유 시 렌더링을 생략하므로 이 오류의 대상이 아님 (4.3)
+- **조치**: 기존 설치 주체를 확인해 정리하거나, 같은 릴리스명으로 소유권 메타데이터를 부여 후 재시도
+  ```bash
+  kubectl -n ${EG_NS} get deploy envoy-gateway -o jsonpath='{.metadata.labels}{"\n"}{.metadata.annotations}{"\n"}'
+  ```
 
-#### T-10. 릴리스 Secret 크기 초과
+#### H-04. certgen hook 실패
 
 ```text
-Error: create: failed to create: Secret "sh.helm.release.v1.eg-crds.v1" is invalid:
-data: Too long: must have at most 1048576 bytes
-```
-
-- **원인**: 대형 CRD를 Helm **템플릿**으로 릴리스에 포함 (예: `gateway-crds-helm`을 `helm install`로 설치). Helm의 multi-secret 드라이버 PR(#12277)은 병합되지 않음
-- **조치**: `helm template ... | kubectl apply --server-side -f -` 방식으로 전환 (6장)
-
-#### T-11. certgen hook Job 실패
-
-```text
-Error: INSTALLATION FAILED: failed pre-install: ... job <release>-...-certgen failed: BackoffLimitExceeded
+Error: INSTALLATION FAILED: failed pre-install: ... job eg-gateway-helm-certgen failed: BackoffLimitExceeded
 Error: INSTALLATION FAILED: failed pre-install: ... timed out waiting for the condition
 ```
 
-- **원인**: certgen 이미지 Pull 실패 / Pod Security·RBAC 문제 / 노드 스케줄 불가(taint, nodeSelector)
-- **확인** (기본 TTL 30초라 Job이 금방 사라짐 → 7.1 values의 `ttlSecondsAfterFinished` 연장 권장)
+- **원인**: 이미지 Pull 실패 (certgen은 envoy-gateway 이미지 사용) / 스케줄 불가 / Secret 생성 권한 문제
+- **확인** (`backoffLimit: 1`, TTL 기본 30초 → 8.1처럼 TTL 연장 권장)
   ```bash
-  kubectl -n ${EG_NS} get job,pod | grep -i certgen
-  kubectl -n ${EG_NS} describe pod -l job-name | tail -40      # job-name 라벨이 있는 Pod(=Job Pod)
-  kubectl -n ${EG_NS} logs job/$(kubectl -n ${EG_NS} get job -o name | grep certgen | cut -d/ -f2)
-  kubectl -n ${EG_NS} get events --sort-by=.lastTimestamp | tail -30
+  kubectl -n ${EG_NS} get job,pod -l app=certgen
+  kubectl -n ${EG_NS} describe pod -l app=certgen | sed -n '/Events/,$p'
+  kubectl -n ${EG_NS} logs -l app=certgen --tail=100
+  kubectl get events -n ${EG_NS} --sort-by=.lastTimestamp | tail -30
   ```
 - **조치**
-  - 이미지: `global.images.envoyGateway.image` 경로 수정 (certgen은 envoy-gateway 이미지 사용)
-  - 스케줄: `certgen.job.tolerations` / `nodeSelector` 지정
-  - certgen 비활성화는 금지(차트 주석: OIDC/OAuth2 등 기능 영향). 사설 인증서가 필요하면 cert-manager로 미리 `envoy-gateway`, `envoy`, `envoy-rate-limit` Secret 생성 — certgen은 기존 Secret을 덮어쓰지 않음
+  - 이미지: `global.imageRegistry` / `global.images.envoyGateway.image`
+  - 스케줄: `certgen.job.tolerations` / `nodeSelector` / `affinity`
+  - certgen 비활성화(`--no-hooks`)는 금지 → H-05 발생. 사설 인증서가 필요하면 cert-manager로 `envoy-gateway`, `envoy`, `envoy-rate-limit` Secret을 미리 생성 (certgen은 기존 Secret을 덮어쓰지 않음)
 
-#### T-12. `--wait` 타임아웃
+#### H-05. envoy-gateway Pod `ContainerCreating` — Secret 없음
+
+```text
+MountVolume.SetUp failed for volume "certs" : secret "envoy-gateway" not found
+```
+
+- **원인**: certgen 미실행 (`--no-hooks`, hook 실패 후 수동 진행, Secret 수동 삭제)
+- **조치**: `helm upgrade ${EG_RELEASE} ${CHART_TGZ} -n ${EG_NS} -f eg-values.yaml` (pre-upgrade hook으로 certgen 재실행)
+
+#### H-06. `--wait` 타임아웃
 
 ```text
 Error: INSTALLATION FAILED: context deadline exceeded
 ```
 
-- **원인**: envoy-gateway Pod가 시간 내 Ready 되지 않음 (이미지, CRD 불일치, 리소스 부족)
 - **확인**
   ```bash
   kubectl -n ${EG_NS} get pod -o wide
   kubectl -n ${EG_NS} describe deploy/envoy-gateway | tail -30
   kubectl -n ${EG_NS} logs deploy/envoy-gateway --previous 2>/dev/null | tail -50
   ```
-- **조치**: 원인별로 T-13 / T-14로 이동. 원인 해결 후 `helm upgrade --install ... --wait`
+- **조치**: 원인별 R-01 / R-02 / H-05
 
 ---
 
-### Phase 4 — 설치 후
+### 설치 후
 
-#### T-13. ImagePullBackOff
+#### R-01. ImagePullBackOff
 
 | 대상 Pod | 이미지 출처 | 수정 위치 |
 |---|---|---|
-| `envoy-gateway`, certgen | 차트 | `global.images.envoyGateway.image` |
-| `envoy-*` (데이터플레인) | 컨트롤러가 생성 | `global.images.envoyProxy.image` 또는 `EnvoyProxy.spec.provider.kubernetes.envoyDeployment.container.image` |
-| `envoy-ratelimit` | 컨트롤러가 생성 | `global.images.ratelimit.image` (기본 `:master` → 고정 태그 권장) |
+| `envoy-gateway`, certgen | 차트 | `global.imageRegistry` 또는 `global.images.envoyGateway.image` |
+| `envoy-*` envoy 컨테이너 | 컨트롤러 (ConfigMap 설정) | **`global.images.envoyProxy.image` 지정 필수** (4.5) 또는 `EnvoyProxy.spec.provider.kubernetes.envoyDeployment.container.image` |
+| `envoy-*` shutdown-manager 컨테이너 | 컨트롤러 (envoy-gateway 이미지 재사용) | envoy-gateway 이미지 설정을 따름 |
+| `envoy-ratelimit` | 컨트롤러 | `global.images.ratelimit.image` (기본 `:0482748e`) |
 
 ```bash
 kubectl -n ${EG_NS} get pod -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{..image}{"\n"}{end}'
-kubectl -n ${EG_NS} describe pod <pod> | grep -A5 -E 'Failed|Back-off'
+kubectl -n ${EG_NS} get cm envoy-gateway-config -o jsonpath='{.data.envoy-gateway\.yaml}' | grep -E 'image:'
 ```
 
-- 레지스트리 프록시가 해당 upstream(docker.io 등)을 캐시하는지, 프로젝트 경로가 맞는지 확인
+- values 변경 후 `helm upgrade` → ConfigMap 갱신 → envoy-gateway가 재기동되며 데이터플레인 Deployment 갱신
 
-#### T-14. envoy-gateway CrashLoopBackOff — `no matches for kind`
+#### R-02. envoy-gateway CrashLoopBackOff — `no matches for kind`
 
 ```text
 failed to create gatewayapi controller: error watching resources:
 no matches for kind "ListenerSet" in version "gateway.networking.k8s.io/v1"
 ```
 
-- **원인**: 클러스터 CRD가 EG 1.9.2 기대 버전보다 낮음. 대부분 **기존 CRD가 있는 상태에서 `crds.enabled=true`로 설치 → Helm이 CRD를 건너뜀**
-- **확인**
-  ```bash
-  helm install ... --debug 2>&1 | grep -i 'already present'
-  kubectl get crd gateways.gateway.networking.k8s.io \
-    -o jsonpath='{.metadata.annotations.gateway\.networking\.k8s\.io/bundle-version}{"\n"}'
-  kubectl get crd listenersets.gateway.networking.k8s.io
-  ```
-- **조치**: 6장 절차로 CRD 갱신 → `kubectl -n ${EG_NS} rollout restart deploy/envoy-gateway`
+- **원인**: 클러스터 CRD가 번들보다 낮거나 누락 (C-01, C-04)
+- **확인**: 6.4 스크립트
+- **조치**: Phase 2 → `kubectl -n ${EG_NS} rollout restart deploy/envoy-gateway`
 
-#### T-15. GatewayClass `Accepted` 아님 / status 비어 있음
+#### R-03. GatewayClass `Accepted` 아님
 
-- **원인**
-  - `controllerName` 오타 (`config.envoyGateway.gateway.controllerName`과 불일치)
-  - `parametersRef`의 EnvoyProxy가 없거나 네임스페이스 누락
-  - envoy-gateway Pod 미기동
+- **원인**: `controllerName` 불일치 (`config.envoyGateway.gateway.controllerName`), `parametersRef`의 EnvoyProxy 없음/네임스페이스 누락, 컨트롤러 미기동
 - **확인**
   ```bash
   kubectl get gatewayclass <name> -o yaml | sed -n '/status:/,$p'
@@ -788,11 +887,12 @@ no matches for kind "ListenerSet" in version "gateway.networking.k8s.io/v1"
   kubectl -n ${EG_NS} logs deploy/envoy-gateway | grep -i gatewayclass | tail
   ```
 
-#### T-16. Gateway `Programmed=False` / Service `EXTERNAL-IP <pending>`
+#### R-04. Gateway `Programmed=False` / Service `EXTERNAL-IP <pending>` / 1-in-N 유실
 
 - **원인 후보**
-  - OCCM이 Octavia LB 생성 실패 (쿼터, 서브넷, floating IP)
-  - Cilium LB-IPAM 풀(`CiliumLoadBalancerIPPool`)이 생성되어 OCCM과 IP 할당 경합
+  - OCCM의 Octavia LB 생성 실패 (쿼터, 서브넷, floating IP)
+  - Cilium LB-IPAM 풀(`CiliumLoadBalancerIPPool`) 생성 시 OCCM과 IP 할당 경합
+  - ETP `Local` 기본값 + Octavia 헬스모니터 미설정 → Envoy Pod 없는 노드로 간 트래픽 유실
 - **확인**
   ```bash
   kubectl -n ${EG_NS} get svc -l gateway.envoyproxy.io/owning-gateway-name=<gw>
@@ -800,41 +900,49 @@ no matches for kind "ListenerSet" in version "gateway.networking.k8s.io/v1"
   kubectl get ciliumloadbalancerippool 2>/dev/null
   openstack loadbalancer list | grep <svc-name-fragment>
   ```
-- **1-in-N 트래픽 유실 (일부 요청만 실패)**
-  - EG Service 기본 `externalTrafficPolicy: Local` + Octavia 헬스모니터 미설정 → envoy Pod 없는 노드로 간 트래픽 유실
-  - EnvoyProxy `envoyService.annotations`에 `loadbalancer.openstack.org/enable-health-monitor: "true"` (8장 예시), 보안그룹에서 헬스체크 포트 허용 확인
-  - Service 어노테이션은 Gateway가 아니라 **EnvoyProxy**에 넣어야 함 (컨트롤러가 Service를 관리)
+- **조치**: EnvoyProxy `envoyService.annotations`에 `loadbalancer.openstack.org/enable-health-monitor: "true"`, 보안그룹에서 헬스체크 포트 허용 (Service는 컨트롤러가 관리하므로 어노테이션은 EnvoyProxy에)
 
-#### T-17. Envoy Pod 생성 시 webhook 호출 실패
+#### R-05. topology injector
 
-```text
-Error creating: Internal error occurred: failed calling webhook "...envoyproxy.io": ... context deadline exceeded
-```
-
-- **원인**: topology injector(mutating webhook)에 API 서버가 도달 불가 (Pod 네트워크/방화벽, envoy-gateway 미기동)
+- **구성**: `pods/binding` CREATE를 EG 네임스페이스에 한해 가로채 토폴로지 라벨 주입, `failurePolicy: Ignore`
+- **증상**: Pod 생성은 막히지 않음. 대신 zone 관련 라벨 누락으로 zone-aware 라우팅이 기대대로 동작하지 않을 수 있음
 - **확인**
   ```bash
-  kubectl get mutatingwebhookconfiguration | grep -i envoy
+  kubectl get mutatingwebhookconfiguration envoy-gateway-topology-injector.${EG_NS} -o yaml | grep -E 'caBundle|failurePolicy|port'
   kubectl -n ${EG_NS} get endpointslice -l kubernetes.io/service-name=envoy-gateway
   ```
-- **조치**: envoy-gateway 기동/서비스 엔드포인트 정상화 우선. 임시 회피가 필요하면 `--set topologyInjector.enabled=false`로 upgrade (zone-aware 라우팅 기능 영향 확인)
+- **조치**: caBundle이 비어 있으면 certgen 재실행(H-05와 동일), 필요 없으면 `topologyInjector.enabled=false`
+- **잔존 주의**: hook 리소스라 uninstall 후에도 남음 → 13.3 정리
 
-#### T-18. TCPRoute / UDPRoute가 에러 없이 무시됨
+#### R-06. TCPRoute / UDPRoute가 에러 없이 무시됨
 
-- **원인**: Gateway API v1.6 CRD 미적용 상태에서 EG 1.9 기동
-- **확인**: `kubectl get crd tcproutes.gateway.networking.k8s.io -o jsonpath='{.spec.versions[*].name}{"\n"}'` 에 `v1` 존재 여부
-- **조치**: 6장 CRD 적용 → EG 재시작. 매니페스트는 `apiVersion: gateway.networking.k8s.io/v1` 사용 권장 (experimental 채널은 v1alpha2도 당분간 서빙)
-
-#### T-19. `helm upgrade` 후에도 CRD가 그대로
-
-- **원인**: Helm은 `crds/` 디렉터리의 CRD를 upgrade하지 않음
-- **조치**: 업그레이드 순서를 **CRD(6장) → `helm upgrade`** 로 고정
+- **원인**: v1.6 CRD 미적용 상태에서 EG 1.9 기동 (EG 1.9는 TCP/UDP Route를 `v1`으로 reconcile)
+- **조치**: Phase 2 → EG 재시작. 매니페스트는 `apiVersion: gateway.networking.k8s.io/v1` 권장
 
 ---
 
-## 11. 진단 정보 수집 스크립트
+### Cilium
 
-문제 발생 시 아래를 실행해 결과 디렉터리를 공유한다. Secret은 **이름만** 수집한다. 공유 전 values 등에 민감정보가 없는지 확인할 것.
+#### CI-01. CRD 갱신 후 Cilium operator 오류
+
+- **원인**: Cilium 1.19.x는 Gateway API v1.4 기준. v1.5+ CRD에서 operator 실패 사례 보고 있음
+- **확인**
+  ```bash
+  kubectl -n kube-system logs deploy/cilium-operator --since=15m | grep -iE 'gateway|tlsroute|error'
+  kubectl get crd tlsroutes.gateway.networking.k8s.io \
+    -o jsonpath='{range .spec.versions[*]}{.name}{" served="}{.served}{"\n"}{end}'
+  ```
+- **조치**
+  - CRD 롤백은 VAP 규칙 2·저장 버전 때문에 사실상 불가 → **전진 복구**
+  - 단기: Cilium Gateway API 비활성화(`gatewayAPI.enabled=false`) 후 해당 Route를 EG로 이관
+  - 정식: Cilium 1.20 업그레이드
+  - 결과는 문서 변경 이력에 기록
+
+---
+
+## 12. 진단 정보 수집 스크립트
+
+Secret은 **이름만** 수집한다. 공유 전 values에 민감정보가 없는지 확인한다.
 
 ```bash
 #!/usr/bin/env bash
@@ -852,21 +960,26 @@ c helm helm list -A -a
 c helm helm history "$REL" -n "$NS"
 c helm helm status "$REL" -n "$NS"
 c helm helm get values "$REL" -n "$NS"
+c helm sh -c "helm get hooks $REL -n $NS | grep -E '^kind:|^  name:'"
+c helm sh -c "helm get manifest $REL -n $NS | grep -E '^kind:' | sort | uniq -c"
 
 # EG 네임스페이스
-c k8s kubectl -n "$NS" get all,job,cm,endpointslice -o wide
+c k8s kubectl -n "$NS" get all,job,cm,sa,role,rolebinding,endpointslice -o wide
 c k8s kubectl -n "$NS" get secret                       # 이름/타입만
 c k8s kubectl -n "$NS" get events --sort-by=.lastTimestamp
 c k8s kubectl -n "$NS" describe pod
 c logs kubectl -n "$NS" logs deploy/envoy-gateway --since=30m
 c logs kubectl -n "$NS" logs deploy/envoy-gateway --previous
-for j in $(kubectl -n "$NS" get job -o name 2>/dev/null); do c logs kubectl -n "$NS" logs "$j"; done
+c logs kubectl -n "$NS" logs -l app=certgen --tail=200
+c k8s sh -c "kubectl -n $NS get cm envoy-gateway-config -o jsonpath='{.data.envoy-gateway\.yaml}'"
 
-# CRD / VAP / webhook
+# CRD / VAP / webhook / cluster RBAC
 c crd kubectl get crd -o custom-columns='NAME:.metadata.name,BUNDLE:.metadata.annotations.gateway\.networking\.k8s\.io/bundle-version,CHANNEL:.metadata.annotations.gateway\.networking\.k8s\.io/channel,STORED:.status.storedVersions'
 c crd kubectl get crd tlsroutes.gateway.networking.k8s.io -o jsonpath='{range .spec.versions[*]}{.name}{" served="}{.served}{" storage="}{.storage}{"\n"}{end}'
-c crd kubectl get validatingadmissionpolicy,validatingadmissionpolicybinding
+c crd kubectl get validatingadmissionpolicy,validatingadmissionpolicybinding -o wide
+c crd sh -c "kubectl get validatingadmissionpolicy safe-upgrades.gateway.networking.k8s.io -o jsonpath='{.metadata.labels}{\"\n\"}{.metadata.annotations}'"
 c crd kubectl get mutatingwebhookconfiguration
+c crd sh -c "kubectl get clusterrole,clusterrolebinding | grep -E 'gateway-helm|envoy-gateway'"
 
 # Gateway API 리소스
 c gwapi kubectl get gatewayclass -o wide
@@ -883,47 +996,68 @@ tar -czf "$OUT.tar.gz" "$OUT" && echo "수집 완료: $OUT.tar.gz"
 
 ---
 
-## 12. 롤백 / 제거
+## 13. 업그레이드 / 롤백 / 제거
 
-### 12.1 EG 릴리스 롤백
+### 13.1 차트 업그레이드 (예: 1.9.x → 1.9.y)
+
+1. 새 차트 pull → 6.2·6.3(TLSRoute Go/No-Go)·6.4 반복
+2. 새 차트의 `crds/`를 kubectl SSA로 적용 (VAP 존재 상태: experimental → experimental, v1.5+ → 통과)
+   ```bash
+   kubectl apply --server-side --force-conflicts -R -f ${NEW_CHART_DIR}/charts/crds/crds
+   ```
+3. `helm upgrade ${EG_RELEASE} ${NEW_CHART_TGZ} -n ${EG_NS} -f eg-values.yaml --wait --timeout 10m`
+4. Phase 4·5 재검증
+
+### 13.2 EG 릴리스 롤백
 
 ```bash
 helm history ${EG_RELEASE} -n ${EG_NS}
 helm rollback ${EG_RELEASE} <revision> -n ${EG_NS} --wait
 ```
 
-- CRD는 롤백되지 않음 (Helm 외부 관리)
+- CRD는 롤백되지 않음. 이전 차트가 요구하는 CRD가 현재 CRD와 호환되는지 별도 판단
 
-### 12.2 EG 제거
+### 13.3 EG 제거
 
-1. EG GatewayClass를 쓰는 Gateway부터 삭제 → 컨트롤러가 데이터플레인(envoy Deployment/Service, Octavia LB)을 정리하게 함
+1. EG GatewayClass를 쓰는 Gateway부터 삭제 → 컨트롤러가 Envoy 리소스와 Octavia LB 정리
    ```bash
    kubectl get gateway -A -o json | jq -r '.items[] | select(.spec.gatewayClassName=="eg") | "\(.metadata.namespace)/\(.metadata.name)"'
    ```
-2. `helm uninstall ${EG_RELEASE} -n ${EG_NS}`
-3. 남은 리소스 확인: `kubectl -n ${EG_NS} get all`, `openstack loadbalancer list`
+2. `helm uninstall ${EG_RELEASE} -n ${EG_NS}` → 릴리스 리소스와 **VAP** 삭제
+3. 남는 리소스 정리 (변경 승인 후)
+   ```bash
+   kubectl delete mutatingwebhookconfiguration envoy-gateway-topology-injector.${EG_NS}
+   kubectl delete clusterrolebinding,clusterrole eg-gateway-helm-certgen:${EG_NS}
+   kubectl -n ${EG_NS} delete rolebinding,role,serviceaccount eg-gateway-helm-certgen
+   kubectl -n ${EG_NS} delete secret envoy-gateway envoy envoy-rate-limit
+   kubectl -n ${EG_NS} get all                       # 컨트롤러 생성 리소스 잔존 여부
+   openstack loadbalancer list                       # 고아 LB 여부
+   ```
 4. EG CRD(`gateway.envoyproxy.io`) 삭제는 **EG를 완전히 걷어낼 때만**. CRD 삭제 = 해당 CR 전부 삭제
 
-### 12.3 하지 말아야 할 것
+### 13.4 하지 말아야 할 것
 
-- ❌ **Gateway API CRD(`gateway.networking.k8s.io`) 삭제** — Cilium Gateway가 공유. 삭제 시 Cilium의 Gateway/HTTPRoute까지 모두 사라짐
-- ❌ **CRD 다운그레이드** — VAP가 거부하며, 저장 버전·컨트롤러 호환성 문제로 지원 경로가 아님. 문제가 생기면 전진 복구(T-06)
+- ❌ **Gateway API CRD(`gateway.networking.k8s.io`) 삭제** — Cilium Gateway와 공유. 삭제 시 Cilium의 Gateway/HTTPRoute도 사라짐
+- ❌ **CRD 다운그레이드** — VAP 규칙 2가 거부. 저장 버전·컨트롤러 호환성 문제로 지원 경로가 아님
+- ❌ **기존 CRD가 있는 클러스터에서 Phase 2 없이 `helm install`** — C-01 → C-02 상태로 진입
+- ❌ **`--no-hooks`** — certgen 미실행으로 envoy-gateway 기동 불가 (H-05)
 - ❌ experimental → standard 재적용 — VAP는 허용하지만 experimental 필드가 제거되어 기존 리소스 의미가 바뀔 수 있음
 
 ---
 
-## 13. 참고 자료
+## 14. 참고 자료
 
-- Envoy Gateway v1.9 — Install with Helm (CRD 분리 설치, 업그레이드 주의사항): https://gateway.envoyproxy.io/v1.9/install/install-helm/
-- Envoy Gateway v1.9 — Install with Kubernetes YAML (v1.6 CRD 선행 요구, 업그레이드 절차): https://gateway.envoyproxy.io/v1.9/install/install-yaml/
+- 분석 대상: `gateway-helm` 1.9.2 차트 — `templates/`, `charts/crds/templates/gatewayapi-safe-upgrade-policy.yaml`, `charts/crds/crds/`
+- Envoy Gateway v1.9 — Install with Helm: https://gateway.envoyproxy.io/v1.9/install/install-helm/
+- Envoy Gateway v1.9 — Install with Kubernetes YAML (v1.6 CRD 선행 요구): https://gateway.envoyproxy.io/v1.9/install/install-yaml/
 - Envoy Gateway v1.9 — Gateway Helm Chart values: https://gateway.envoyproxy.io/v1.9/install/gateway-helm-api/
-- Envoy Gateway v1.9 릴리스 공지 (safe-upgrades VAP 소유권, `safeUpgradePolicy.enabled`): https://gateway.envoyproxy.io/news/releases/v1.9/
+- Envoy Gateway v1.9 릴리스 공지: https://gateway.envoyproxy.io/news/releases/v1.9/
 - Envoy Gateway 호환성 매트릭스: https://gateway.envoyproxy.io/news/releases/matrix/
-- Gateway API v1.5.0 릴리스 (TLSRoute v1alpha2 제거 예고, safe-upgrades VAP 도입): https://github.com/kubernetes-sigs/gateway-api/releases/tag/v1.5.0
-- Gateway API v1.6.0-rc.1 릴리스 노트 (TCPRoute/UDPRoute v1 승격, VAP 규칙): https://github.com/kubernetes-sigs/gateway-api/releases/tag/v1.6.0-rc.1
+- Helm — Custom Resource Definitions (crds/ 디렉터리 제약): https://helm.sh/docs/chart_best_practices/custom_resource_definitions/
+- Helm — Chart Hooks (hook 리소스 관리, 삭제 정책): https://helm.sh/docs/topics/charts_hooks/
+- Gateway API v1.5.0 릴리스 (safe-upgrades VAP 도입): https://github.com/kubernetes-sigs/gateway-api/releases/tag/v1.5.0
 - Kubernetes 블로그 — Gateway API v1.6: https://kubernetes.io/blog/2026/08/03/gateway-api-v1-6-release/
-- Helm PR #12277 (대형 릴리스 multi-secret, 미병합): https://github.com/helm/helm/pull/12277
-- Cilium Gateway API 문서 (v1.4.1 CRD 요구, TLSRoute 선택): https://docs.cilium.io/en/stable/network/servicemesh/gateway-api/gateway-api/
+- Cilium Gateway API 문서: https://docs.cilium.io/en/stable/network/servicemesh/gateway-api/gateway-api/
 - Broadcom KB 448213 — Gateway API v1.5.1 CRD 환경에서 Cilium 1.19.x operator 실패 사례: https://knowledge.broadcom.com/external/article/448213
 
 ---
@@ -932,5 +1066,6 @@ helm rollback ${EG_RELEASE} <revision> -n ${EG_NS} --wait
 
 | 날짜 | 내용 |
 |---|---|
-| 2026-10-11 | 최초 작성 (EG v1.9.2 / Gateway API v1.6.1 experimental / Cilium 1.19.1) |
-| | 6.2 TLSRoute Go/No-Go 실측 결과 기록 예정 |
+| 2026-10-11 | 최초 작성 (gateway-crds-helm 기반) |
+| 2026-10-11 | gateway-helm 번들 CRD 기반으로 전면 개정. 1.9.2 차트 분석 반영 (VAP lookup, hook 구성, 이미지 로직, TLSRoute v1alpha2 서빙 확인) |
+| | Phase 5 Cilium 실측 결과 기록 예정 |
